@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "vitorcanoas.nightlight",
+  "name": "Night Light",
+  "version": "1.0.0",
+  "author": "Vitor Canoas",
+  "license": "MIT",
+  "homepage": "https://github.com/vitorcanoas/omarchy-nightlight",
+  "description": "Per-monitor blue-light filter: one switch and one intensity slider for each screen",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Night Light",
+    "description": "Per-monitor blue-light filter with a switch and a 0-100% slider per screen",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
