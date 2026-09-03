@@ -1,19 +1,25 @@
 # Omarchy Night Light
 
-A blue-light filter with an **independent intensity per monitor**, as an Omarchy
-bar widget: one minimal glyph on the bar, and a panel with a switch and a
-0–100% slider for every screen you have.
+**Per-monitor colour temperature.** A separate blue-light filter, with its own
+intensity, for every screen — as an Omarchy bar widget: one minimal glyph on the
+bar, and a panel with a switch and a 0–100% slider per screen.
 
 ## Why
 
-Omarchy's built-in night light drives `hyprsunset`, which applies one
-temperature to **all** video outputs at once. There is no way to say "warm on
-the monitor I read on, neutral on the one I keep for dark-mode terminals".
+Every other night-light option for Omarchy — the built-in one included — drives
+`hyprsunset` or `sunsetr`, and both apply a single temperature to **all** video
+outputs at once. There is no way to say "warm on the monitor I read on, neutral
+on the one I keep for dark-mode terminals".
 
-`wl-gammarelay-rs` is the daemon that exposes a DBus object *per output*, which
-is what makes per-monitor control possible. This plugin drives it, remembers
-your choice for each screen across reboots, and puts the whole thing behind one
-bar icon.
+That is the gap this fills. `wl-gammarelay-rs` exposes a DBus object *per
+output*, which is what makes per-monitor temperature possible at all. This
+plugin drives it, remembers your choice for each screen across reboots, and puts
+the whole thing behind one bar icon.
+
+<img alt="Night Light in the Omarchy bar" src="preview.png" />
+
+<img width="300" alt="The Night Light panel, one row per screen" src="panel.png" />
+<img width="300" alt="The drawer, with per-screen brightness, pause and schedule" src="drawer.png" />
 
 The intensity scale matches the Windows "Night light" slider, so the numbers
 mean what you expect:
@@ -25,7 +31,15 @@ Kelvin = 6500 - (53 x percent)      0% = 6500K neutral,  100% = 1200K deep amber
 ## Requirements
 
 - Omarchy 4 with its Quickshell desktop (`omarchy-shell`)
-- [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs) — `yay -S wl-gammarelay-rs`
+- [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs)
+
+`wl-gammarelay-rs` is **not** part of Omarchy and is not pulled in by installing
+this plugin — Omarchy never runs anything from a plugin folder. Install it
+yourself from the AUR:
+
+```bash
+yay -S wl-gammarelay-rs
+```
 
 > **hyprsunset must not be running.** `hyprsunset` and `wl-gammarelay-rs` both
 > claim the Wayland `wlr-gamma-control` protocol, which allows a single client
@@ -58,12 +72,39 @@ dependency:
 | scroll | raise/lower every screen by 5 points |
 
 In the panel, each screen gets its own row: a switch to turn that screen's
-filter on or off, and a slider for its intensity. **All** and **None** act on
-every screen at once. Dragging a slider previews immediately and writes once the
-gesture settles, so a drag never floods the machine with processes.
+filter on or off, and a slider for its intensity. Dragging a slider changes the
+colour live and saves once you let go, so a drag never floods the machine with
+processes or records the values you merely passed through.
 
-Keyboard: `j`/`k` move between rows, `h`/`l` change the intensity of the row you
-are on, `Space`/`Enter` flip a switch, `Esc` closes.
+The `⋯` button beside the master switch opens a drawer with per-screen
+brightness, pause, and the schedule. It closes again every time you open the
+panel, so the default view stays the list of screens.
+
+Keyboard: `j`/`k` move between rows, `h`/`l` change the value of the row you are
+on, `Space`/`Enter` flip a switch, `Esc` closes. The drawer's own controls are
+mouse-driven.
+
+## Brightness
+
+Each screen also gets a **software brightness** slider, in the panel's drawer
+(the `⋯` button next to the master switch).
+
+This is not a repackaging of Omarchy's own brightness control, and it is worth
+knowing why both exist:
+
+|  | Omarchy's `omarchy-brightness-display` | this plugin |
+|---|---|---|
+| How | the monitor's own backlight, over DDC/CI | the compositor's gamma ramp |
+| Works on | monitors that answer DDC — many desktop monitors do not | every output, always |
+| Real light output | yes, genuinely dimmer backlight | no, the image is scaled darker |
+
+So use Omarchy's when your monitor supports it: dimming the actual backlight is
+better for your eyes and for power. Use this one for the screen that ignores
+DDC entirely, which is the common case for a second monitor — dimming one panel
+at night without touching the other is the whole reason it is here.
+
+The floor is 10%. `wl-gammarelay-rs` allows lower, but a screen at 2% is
+unreadable and the only way back would be the CLI.
 
 ## Using the CLI
 
@@ -79,7 +120,13 @@ omarchy-nightlight on              # restore the saved percentages
 omarchy-nightlight toggle          # off if anything is on, else on
 omarchy-nightlight restore         # re-apply the saved file (use at login)
 omarchy-nightlight --json          # machine-readable state
+
+omarchy-nightlight brightness 80        # software brightness, every screen
+omarchy-nightlight DP-2 brightness 80   # software brightness on DP-2 only
 ```
+
+Add `--no-save` to any of these to apply it without recording it — that is what
+the panel uses while a slider is being dragged.
 
 Output names are the ones `hyprctl monitors` prints (`DP-2`, `HDMI-A-1`, …).
 
@@ -105,6 +152,36 @@ omarchy-nightlight restore
 `restore` only touches outputs that have a line in the config file, so the same
 autostart is safe to version across machines that never configured night light.
 
+## Pause and schedule
+
+Both live in the drawer behind the `⋯` button, so the panel you see when you
+click the bar icon stays the list of screens and nothing else.
+
+**Pause** turns the filter off for 15, 30 or 60 minutes and brings it back by
+itself — for editing photos or video, where a warm screen lies to you about
+colour. Each screen returns to its own intensity, because pausing goes through
+`off`/`on`, which never rewrite what you saved.
+
+**Schedule** is off by default and turns the filter on and off at two times you
+type. It schedules *on and off*, not an intensity, so every screen keeps its own
+percentage and a screen set to 0% stays neutral. It is clock-only: no location,
+no sunset calculation, no network.
+
+The countdown and the schedule are plain QML timers inside the plugin. They are
+deliberately not systemd timers or cron entries: Omarchy runs nothing when a
+plugin is removed, so anything registered outside this folder would outlive the
+uninstall forever.
+
+<details>
+<summary>Forcing one shared intensity at night</summary>
+
+Set `nightPercent` on the plugin's entry in `shell.json` to a number above 0 and
+the schedule will apply that percentage to every screen instead of restoring
+each screen's own. It has no UI because a single global intensity is the
+opposite of what most people install this for.
+
+</details>
+
 ## Configuration
 
 `~/.config/omarchy/nightlight.conf`, one `output=percent` line per screen:
@@ -117,22 +194,74 @@ HDMI-A-1=0
 It stores the percentage you **chose**, not what is currently on screen — which
 is why `off` erases nothing and `on` can bring everything back.
 
+<details>
+<summary>Why a file instead of inline settings in <code>shell.json</code></summary>
+
+Omarchy's rule is that plugin settings live inline on the bar entry in
+`shell.json`, and this plugin follows it for everything that is a setting: the
+one option it has (`command`) is read with `setting()` from that entry.
+
+The saved percentages are not a setting, they are backend state, and they have
+to survive the shell being down. `omarchy-nightlight restore` runs at login
+before the bar exists, and a keybinding or an SSH session has to reach the same
+values without Quickshell running at all. A file both sides can read is the only
+thing that satisfies that; parsing `shell.json` from bash would make the CLI
+depend on the very component it has to work without.
+
+</details>
+
 **A screen saved at `0` is deliberately neutral.** Global commands
 (`omarchy-nightlight on`, `+5`, the scroll gesture, the **All** button) skip it,
 so a portrait monitor you keep clean stays clean. Naming the output explicitly
 (`omarchy-nightlight HDMI-A-1 30`, or its slider in the panel) still works —
 that is how you change your mind.
 
-## Uninstall
+## Optional: an entry in the Omarchy menu
 
-```bash
-omarchy plugin remove vitorcanoas.nightlight
-rm -f ~/.local/bin/omarchy-nightlight        # only if you ran install.sh
+Omarchy only reads menu extensions from *your* config, never from a plugin
+folder, so this is a manual paste — which also means it does not disappear when
+the plugin does. Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
+
+```jsonc
+"trigger.toggle.nightlight": {
+  "icon": "󰔎",
+  "label": "Nightlight",
+  "action": "omarchy-nightlight toggle",
+  "checked": "omarchy-nightlight --json | jq -e '.outputs|any(.on)'"
+}
 ```
 
-Screens are left at whatever temperature they were on; run
-`omarchy-nightlight off` first if you want them neutral. The config file is left
-in place.
+Needs `omarchy-nightlight` on your `PATH` (see the optional installer above) and
+`jq` for the `checked` expression. Remove the block by hand if you uninstall.
+
+## Licensing
+
+This plugin is MIT. `wl-gammarelay-rs` is GPL-3.0-only, which does **not** reach
+this code: the two are separate processes talking over DBus, and IPC between
+separate programs is not linking. Nothing here is derived from its source.
+
+## Uninstall
+
+Set your screens back to neutral first — removing the plugin does not, and a
+forgotten filter is confusing later:
+
+```bash
+omarchy-nightlight off
+omarchy plugin remove vitorcanoas.nightlight
+```
+
+`omarchy plugin remove` only deletes the plugin folder. It never runs anything
+from the plugin, so two things it cannot clean up are left behind, both
+harmless and both one command:
+
+```bash
+rm -f ~/.local/bin/omarchy-nightlight        # only if you ran install.sh
+rm -f ~/.config/omarchy/nightlight.conf      # your saved percentages
+```
+
+Remove the bar entry from `~/.config/omarchy/shell.json` too if you added it by
+hand rather than with `omarchy plugin enable`, and the menu block from
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` if you pasted one.
 
 ## Troubleshooting
 
@@ -157,11 +286,23 @@ omarchy plugin list --json | jq '.[] | select(.id == "vitorcanoas.nightlight")'
 ## Development
 
 ```bash
-make validate   # omarchy plugin validate + shell syntax checks
+make validate   # omarchy plugin validate, git diff --check, shell syntax checks
+make lint       # qmllint against the real qs.Ui / qs.Commons modules
 make dev        # rsync this tree into ~/.config/omarchy/plugins and rescan
 ```
 
 The shell reloads plugin QML on save, so `make dev` once and then just edit.
+
+`make lint` builds a temporary import root because `qmllint -I` needs a
+directory *containing* `qs`, not the shell directory itself. The remaining
+`unqualified` and `missing-property` warnings are the same ones Omarchy's own
+first-party panels produce — `bar` is typed `QtObject`, so its members are
+invisible to static analysis.
+
+A bar widget is instantiated **once per monitor**, so this plugin elects a
+single owner for the idle poll and publishes the result to its siblings; only
+that owner registers the IPC handler. Keep that in mind before adding anything
+that shells out.
 
 ## License
 

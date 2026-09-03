@@ -1,10 +1,16 @@
 #!/bin/bash
-# Optional. The bar widget already works without this: it calls the CLI inside
-# the plugin folder by absolute path, so `omarchy plugin add` is all you need.
+# OPTIONAL AND MANUAL. Nothing runs this for you: Omarchy has no install hook,
+# and `omarchy plugin remove` runs nothing either. The bar widget works fully
+# without it, because it calls the CLI inside the plugin folder by absolute
+# path.
 #
-# Run this only if you also want `omarchy-nightlight` on your PATH, for a
-# terminal or for a Hyprland keybinding. It symlinks the CLI into ~/.local/bin
-# and checks the one dependency.
+# Run it only if you also want `omarchy-nightlight` on your PATH, for a terminal
+# or a Hyprland keybinding. It creates ONE symlink in ~/.local/bin.
+#
+# That symlink is the only thing this plugin ever puts outside its own folder,
+# and removing the plugin will NOT take it with them. Undo it by hand:
+#
+#     rm -f ~/.local/bin/omarchy-nightlight
 
 set -euo pipefail
 
@@ -40,6 +46,7 @@ fi
 mkdir -p "$BIN_DIR"
 ln -sfn "$HERE/bin/omarchy-nightlight" "$LINK"
 printf 'linked %s -> %s\n' "$LINK" "$HERE/bin/omarchy-nightlight"
+printf 'remove it later with: rm -f %s\n' "$LINK"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

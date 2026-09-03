@@ -19,6 +19,18 @@
 // explicit percentage instead.
 var DEFAULT_PERCENT = 40
 
+// wl-gammarelay-rs takes 0.1-1.0; below that the screen is unreadable and the
+// only way back is the CLI, so the floor is part of the contract, not a taste.
+var BRIGHTNESS_MIN = 10
+
+function clampBrightness(value) {
+  var n = Math.round(Number(value))
+  if (!isFinite(n)) return 100
+  if (n < BRIGHTNESS_MIN) return BRIGHTNESS_MIN
+  if (n > 100) return 100
+  return n
+}
+
 function clampPercent(value) {
   var n = Math.round(Number(value))
   if (!isFinite(n)) return 0
@@ -56,12 +68,19 @@ function parseState(raw) {
       percent: clampPercent(entry.percent),
       kelvin: Number(entry.kelvin) || 0,
       on: entry.on === true,
-      saved: clampPercent(entry.saved)
+      saved: clampPercent(entry.saved),
+      // Software brightness, 10-100. Absent in an older CLI, so default to full
+      // rather than to zero, which would draw every slider at the bottom and
+      // invite someone to "fix" it by dragging.
+      brightness: entry.brightness === undefined ? 100 : clampBrightness(entry.brightness)
     }
   }
 
   if (names.length === 0) return null
-  return { names: names, byName: byName }
+  // `warning` is advisory, not an error: the CLI still worked. Today the only
+  // one is hyprsunset holding the outputs, which makes every command appear to
+  // do nothing at all -- the single most confusing way this can fail.
+  return { names: names, byName: byName, warning: String(payload.warning || "") }
 }
 
 // Used to reassign the Repeater's model only when the SET of outputs actually
@@ -95,14 +114,52 @@ function clampMessage(raw, limit) {
   return text.length > max ? text.substring(0, max - 1) + "…" : text
 }
 
+// ---- schedule -------------------------------------------------------------
+// "HH:MM" -> minutes since midnight, or -1 when it is not a valid time. Kept
+// strict on purpose: a typo in a time field should leave the schedule inert
+// rather than guess a boundary and darken someone's screen at random.
+function parseTime(value) {
+  var match = String(value === undefined || value === null ? "" : value).trim().match(/^(\d{1,2}):(\d{2})$/)
+  if (!match) return -1
+  var hours = Number(match[1])
+  var minutes = Number(match[2])
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return -1
+  return hours * 60 + minutes
+}
+
+function formatTime(minutes) {
+  var m = Math.max(0, Math.min(24 * 60 - 1, Math.round(Number(minutes) || 0)))
+  var hh = Math.floor(m / 60)
+  var mm = m % 60
+  return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm
+}
+
+// Which side of the schedule `date` falls on: "night" between onAt and offAt,
+// "day" otherwise, "" when either time is unusable. The window normally wraps
+// midnight (on at 20:00, off at 07:00), so the comparison has to handle both
+// the wrapping and the non-wrapping case rather than assuming on < off.
+function phaseAt(date, onAt, offAt) {
+  var on = parseTime(onAt)
+  var off = parseTime(offAt)
+  if (on < 0 || off < 0 || on === off) return ""
+  var now = date.getHours() * 60 + date.getMinutes()
+  var isNight = on < off ? (now >= on && now < off) : (now >= on || now < off)
+  return isNight ? "night" : "day"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     DEFAULT_PERCENT: DEFAULT_PERCENT,
     clampPercent: clampPercent,
+    clampBrightness: clampBrightness,
+    BRIGHTNESS_MIN: BRIGHTNESS_MIN,
     parseState: parseState,
     signature: signature,
     countOn: countOn,
     summary: summary,
-    clampMessage: clampMessage
+    clampMessage: clampMessage,
+    parseTime: parseTime,
+    formatTime: formatTime,
+    phaseAt: phaseAt
   }
 }

@@ -11,6 +11,8 @@
 #   omarchy-nightlight 40              40% on every output
 #   omarchy-nightlight DP-2 40         40% on DP-2 only
 #   omarchy-nightlight DP-2 +5         raise DP-2 by 5 points
+#   omarchy-nightlight brightness 80   software brightness, every output
+#   omarchy-nightlight DP-2 brightness 80   software brightness on DP-2 only
 #   omarchy-nightlight -5              lower every output by 5 points
 #   omarchy-nightlight off             everything neutral
 #   omarchy-nightlight DP-2 off        only DP-2 neutral
@@ -27,6 +29,13 @@
 
 set -uo pipefail
 
+# Set by the --no-save flag. A slider being dragged applies a new temperature
+# many times a second; writing the config on every one of those would hammer the
+# disk and, worse, record intensities the user only passed through on the way to
+# the one they meant. The widget drags with --no-save and drops the flag on
+# release, so exactly one write lands per gesture.
+NO_SAVE=0
+
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/nightlight.conf"
 SERVICE="rs.wl-gammarelay"
 IFACE="rs.wl.gammarelay"
@@ -40,6 +49,14 @@ ON_BELOW=6000
 
 die() { printf 'omarchy-nightlight: %s\n' "$*" >&2; exit 1; }
 
+# The scale is linear in Kelvin, deliberately. The eye perceives colour
+# temperature closer to linearly in mireds (a million over Kelvin), so the warm
+# half of this slider changes the picture much more than the cool half does --
+# 0-50% is a gentle drift, 50-100% is most of the visible effect. That is not a
+# bug and it is not worth "fixing": Windows' Night light slider is linear in
+# Kelvin over this exact range, and matching what people already have a feel for
+# is worth more than a curve that is technically more even. Change it and every
+# saved percentage in everyone's config silently means a different colour.
 pct_to_kelvin() { local k=$(( NEUTRAL - (53 * $1) )); (( k < FLOOR )) && k=$FLOOR; echo "$k"; }
 # Round to the nearest integer instead of truncating, otherwise 40% would read
 # back as 39%.
@@ -89,12 +106,40 @@ outputs() {
 }
 
 kelvin_of() {
-  busctl --user get-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" Temperature 2>/dev/null |
-    grep -oE '[0-9]+' | head -n1
+  get_prop "$1" Temperature | grep -oE '[0-9]+' | head -n1
 }
 
-set_kelvin() {
-  busctl --user set-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" Temperature q "$2" >/dev/null 2>&1
+# One writer for every per-output property wl-gammarelay-rs exposes. Generic
+# because the daemon offers Temperature, Brightness, Gamma and Inverted on the
+# same object with the same call shape; only the first two are wired up here,
+# but adding another is a line rather than a new function.
+set_prop() {
+  busctl --user set-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2" "$3" "$4" >/dev/null 2>&1
+}
+
+get_prop() {
+  busctl --user get-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2" 2>/dev/null
+}
+
+set_kelvin() { set_prop "$1" Temperature q "$2"; }
+
+# Brightness is a double from 0.1 to 1.0; this script speaks whole percent.
+# The floor is the daemon's, not ours: 0 would be a black screen with no way
+# back except the CLI.
+BRIGHT_MIN=10
+
+set_brightness() {
+  local pct=$1
+  (( pct < BRIGHT_MIN )) && pct=$BRIGHT_MIN
+  (( pct > 100 )) && pct=100
+  set_prop "$2" Brightness d "$(printf '%d.%02d' $((pct / 100)) $((pct % 100)))"
+}
+
+brightness_of() {
+  local raw; raw=$(get_prop "$1" Brightness)
+  [[ -z $raw ]] && return 1
+  # `busctl` prints `d 0.8`; turn that into whole percent without needing bc.
+  awk '{ printf "%d", ($NF * 100) + 0.5 }' <<<"$raw"
 }
 
 # ---------------------------------------------------------------------------
@@ -112,13 +157,29 @@ pct_in_file() {
   [[ -n $p ]] && echo "$p"
 }
 
+# Brightness is stored under a second key per output, `DP-2.brightness=80`, so
+# an old config with only temperature lines still reads correctly and a screen
+# that never had its brightness touched simply has no line.
+brightness_in_file() {
+  [[ -f $CONF ]] || return 1
+  local b; b=$(grep -oP "^\s*$1\.brightness\s*=\s*\K[0-9]+" "$CONF" | tail -n1)
+  [[ -n $b ]] && echo "$b"
+}
+
+saved_brightness() {
+  brightness_in_file "$1" || echo 100
+}
+
 # The percentage `on` returns to. Falls back to the default when the output has
 # no choice recorded yet.
 saved_pct() {
   pct_in_file "$1" || echo "$DEFAULT"
 }
 
-save_pct() {
+save_pct() { save_key "$1" "$2"; }
+save_brightness_pct() { save_key "$1.brightness" "$2"; }
+
+save_key() {
   local out=$1 pct=$2
   mkdir -p "$(dirname "$CONF")"
   if [[ ! -f $CONF ]]; then
@@ -134,11 +195,18 @@ save_pct() {
 # The output name is the same one \`hyprctl monitors\` prints.
 EOF
   fi
+  # Write a whole new file and rename it over the old one. `sed -i` and `>>`
+  # both edit in place, so a crash or a full disk mid-write leaves a truncated
+  # file -- and this one file holds every screen's setting, so a bad moment
+  # would cost the lot. rename(2) is atomic: a reader sees the old file or the
+  # new one, never half of either.
+  local tmp="$CONF.tmp.$$"
   if grep -qE "^\s*$out\s*=" "$CONF"; then
-    sed -i -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF"
+    sed -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF" >"$tmp"
   else
-    printf '%s=%s\n' "$out" "$pct" >>"$CONF"
+    { cat "$CONF"; printf '%s=%s\n' "$out" "$pct"; } >"$tmp"
   fi
+  mv -f "$tmp" "$CONF"
 }
 
 # ---------------------------------------------------------------------------
@@ -147,11 +215,36 @@ is_on() {
   [[ -n $k ]] && (( k < ON_BELOW ))
 }
 
+# Apply without touching the file. Every momentary gesture uses this: a switch,
+# `on`, `toggle`. Turning a filter on and off is not a statement about what
+# intensity you want, so it must never rewrite what you chose.
+light_up() {
+  local out=$1 pct=$2
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  set_kelvin "$out" "$(pct_to_kelvin "$pct")"
+}
+
+# The percentage a momentary "on" should use for one output. A screen saved at 0
+# is excused from the filter on purpose; a global command skips it entirely, but
+# when it is named explicitly -- someone clicked its switch -- the gesture still
+# has to do something visible, so it lights up at the default. It is NOT saved,
+# so the screen goes straight back to being excused when it is switched off and
+# `restore` still leaves it neutral at the next login.
+on_pct() {
+  local p; p=$(saved_pct "$1")
+  (( p > 0 )) && echo "$p" || echo "$DEFAULT"
+}
+
+# Apply AND save. Reached only from an explicit percentage -- a slider drag, a
+# `DP-2 40`, a `+5`. That is the one gesture that means "this is the intensity I
+# want for this screen", so it is the one gesture allowed to rewrite the file.
 apply_to() {
   local out=$1 pct=$2
   (( pct < 0 )) && pct=0
   (( pct > 100 )) && pct=100
   set_kelvin "$out" "$(pct_to_kelvin "$pct")"
+  (( NO_SAVE )) && return 0
   # Zero is saved too: "this screen stays neutral" is a choice, and it has to
   # survive `on` and the next boot. That is the whole point of per-output
   # control — a portrait monitor used for dark-mode terminals is usually worse
@@ -161,6 +254,20 @@ apply_to() {
   # temporary blackout, and the chosen intensity must stay on file so `on` can
   # bring it back.
   save_pct "$out" "$pct"
+}
+
+# Software brightness, applied through the same gamma ramp as the temperature.
+# Deliberately NOT the same thing as Omarchy's own brightness control, which
+# drives the monitor's backlight over DDC/CI and does nothing on a display that
+# does not answer DDC. This works on any output the compositor can gamma-adjust,
+# which is all of them.
+apply_brightness() {
+  local out=$1 pct=$2
+  (( pct < BRIGHT_MIN )) && pct=$BRIGHT_MIN
+  (( pct > 100 )) && pct=100
+  set_brightness "$pct" "$out"
+  (( NO_SAVE )) && return 0
+  save_brightness_pct "$out" "$pct"
 }
 
 # Turn "+5", "-5" or "40" into a final percentage for one output.
@@ -175,6 +282,16 @@ resolve_pct() {
   esac
 }
 
+# hyprsunset and wl-gammarelay-rs both claim the Wayland gamma-control protocol,
+# which allows one client per output. When both run, whichever lost the race
+# silently does nothing and the screen simply ignores this tool -- with no error
+# anywhere to explain it. Report it on every read, not only when the daemon
+# fails to start, because the confusing case is the one where it started fine.
+conflict_warning() {
+  pgrep -x hyprsunset >/dev/null 2>&1 || return 0
+  printf 'hyprsunset is running and fighting wl-gammarelay-rs for the same outputs. Stop it: pkill hyprsunset'
+}
+
 # Omarchy's shared on-screen display, so a keybinding gets visual feedback.
 # There is no night-light icon in the Omarchy OSD; "brightness" is the closest.
 osd() {
@@ -184,47 +301,61 @@ osd() {
 
 # ---------------------------------------------------------------------------
 show() {
-  local o k
+  local o k b warning
+  warning=$(conflict_warning)
+  [[ -n $warning ]] && printf 'warning: %s\n\n' "$warning" >&2
   for o in $(outputs); do
     k=$(kelvin_of "$o")
+    b=$(brightness_of "$o") || b=100
     if is_on "$o"; then
-      printf '%-12s %3d%%  (%dK)\n' "$o" "$(kelvin_to_pct "$k")" "$k"
+      printf '%-12s %3d%%  (%dK)   brightness %d%%\n' "$o" "$(kelvin_to_pct "$k")" "$k" "$b"
     else
-      printf '%-12s  off   (saved at %d%%)\n' "$o" "$(saved_pct "$o")"
+      printf '%-12s  off   (saved at %d%%)   brightness %d%%\n' "$o" "$(saved_pct "$o")" "$b"
     fi
   done
 }
 
 # The contract the bar widget reads. Keep the key names stable.
 json() {
-  local o k pct on first=1
-  printf '{"outputs":['
+  local o k b pct on first=1
+  printf '{"warning":"%s","outputs":[' "$(conflict_warning)"
   for o in $(outputs); do
     k=$(kelvin_of "$o"); [[ -z $k ]] && continue
     if is_on "$o"; then on=true; pct=$(kelvin_to_pct "$k")
     else on=false; pct=0; fi
     (( first )) || printf ','
     first=0
-    printf '{"name":"%s","percent":%d,"kelvin":%d,"on":%s,"saved":%d}' \
-      "$o" "$pct" "$k" "$on" "$(saved_pct "$o")"
+    b=$(brightness_of "$o") || b=100
+    printf '{"name":"%s","percent":%d,"kelvin":%d,"on":%s,"saved":%d,"brightness":%d}' \
+      "$o" "$pct" "$k" "$on" "$(saved_pct "$o")" "$b"
   done
   printf ']}\n'
 }
 
 # ---------------------------------------------------------------------------
+ARGS=()
+for arg in "$@"; do
+  if [[ $arg == --no-save ]]; then NO_SAVE=1; else ARGS+=("$arg"); fi
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
 case "${1:-}" in
-  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 ensure_daemon
 
 # If the first argument names an output, the command applies to it alone.
 TARGETS=(); ACTION=""; NAMED_OUTPUT=0
+# ARG is the word after the action, for the verbs that take one (`brightness
+# 80`). It has to be read here because naming an output shifts every position
+# by one, and reading $2 from inside a case branch would silently be the action
+# itself for `DP-2 brightness 80`.
 if [[ -n ${1:-} ]] && outputs | grep -qx -- "$1"; then
-  TARGETS=("$1"); ACTION="${2:-}"; NAMED_OUTPUT=1
+  TARGETS=("$1"); ACTION="${2:-}"; ARG="${3:-}"; NAMED_OUTPUT=1
 else
   mapfile -t TARGETS < <(outputs)
-  ACTION="${1:-}"
+  ACTION="${1:-}"; ARG="${2:-}"
 fi
 
 # An output saved at 0% is deliberately neutral. A global command (no output
@@ -259,13 +390,14 @@ case "$ACTION" in
     # light nothing is applied and the autostart line stays harmless — that is
     # what lets you version one autostart across every machine.
     for o in "${TARGETS[@]}"; do
+      b=$(brightness_in_file "$o") && set_brightness "$b" "$o"
       p=$(pct_in_file "$o") || continue
       (( p > 0 )) && set_kelvin "$o" "$(pct_to_kelvin "$p")"
     done ;;
 
   on)
-    for o in "${TARGETS[@]}"; do excused "$o" && continue; apply_to "$o" "$(saved_pct "$o")"; done
-    osd "$(saved_pct "${TARGETS[0]}")" "Night light"
+    for o in "${TARGETS[@]}"; do excused "$o" && continue; light_up "$o" "$(on_pct "$o")"; done
+    osd "$(on_pct "${TARGETS[0]}")" "Night light"
     show ;;
 
   off)
@@ -282,9 +414,18 @@ case "$ACTION" in
       for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
       osd 0 "Night light off"
     else
-      for o in "${TARGETS[@]}"; do excused "$o" && continue; apply_to "$o" "$(saved_pct "$o")"; done
-      osd "$(saved_pct "${TARGETS[0]}")" "Night light"
+      for o in "${TARGETS[@]}"; do excused "$o" && continue; light_up "$o" "$(on_pct "$o")"; done
+      osd "$(on_pct "${TARGETS[0]}")" "Night light"
     fi
+    show ;;
+
+  brightness)
+    # `omarchy-nightlight brightness 80` on every output, or
+    # `omarchy-nightlight DP-2 brightness 80` on one. Unlike the filter, this is
+    # never skipped for an "excused" screen: being excused is a statement about
+    # colour temperature, not about how bright you want the panel.
+    [[ $ARG =~ ^[0-9]+$ ]] || die "brightness takes a percentage from $BRIGHT_MIN to 100"
+    for o in "${TARGETS[@]}"; do apply_brightness "$o" "$ARG"; done
     show ;;
 
   +[0-9]*|-[0-9]*|[0-9]*)
