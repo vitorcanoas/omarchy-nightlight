@@ -34,17 +34,33 @@ Kelvin = 6500 - (53 x percent)      0% = 6500K neutral,  100% = 1200K deep amber
 - [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs)
 
 `wl-gammarelay-rs` is **not** part of Omarchy and is not pulled in by installing
-this plugin — Omarchy never runs anything from a plugin folder. Install it
-yourself from the AUR:
+this plugin. Install it yourself from the AUR:
 
 ```bash
 yay -S wl-gammarelay-rs
 ```
 
-> **hyprsunset must not be running.** `hyprsunset` and `wl-gammarelay-rs` both
-> claim the Wayland `wlr-gamma-control` protocol, which allows a single client
-> per output. If both run, whichever lost the race silently does nothing. Take
-> `hyprsunset` out of your autostart and `pkill hyprsunset` before using this.
+> **This plugin and Omarchy's built-in night light cannot both work.**
+> Omarchy's own `omarchy toggle nightlight` (the menu entry, and the
+> `omarchy-toggle-nightlight` command) drives `hyprsunset`. `hyprsunset` and
+> `wl-gammarelay-rs` both claim the Wayland `wlr-gamma-control` protocol, which
+> allows a single client per output, so whichever lost the race silently does
+> nothing — **in both directions**:
+>
+> - Press Omarchy's toggle while this plugin's daemon holds the outputs, and
+>   Omarchy's night light appears to do nothing.
+> - Start this plugin's daemon while `hyprsunset` is up, and this plugin appears
+>   to do nothing. The panel says so rather than staying silent.
+>
+> On a stock Omarchy 4, `hyprsunset` is not autostarted — it is started on
+> demand, so `pkill hyprsunset` clears the conflict only until the next thing
+> starts it again. Four things do: the `SUPER + CTRL + N` default binding, the
+> menu's night-light toggle, **Setup → Hyprsunset**, and the commented
+> `o.launch_on_start("hyprsunset")` in `~/.config/hypr/hyprsunset.conf` if you
+> ever uncommented it.
+>
+> **Pick one and stay with it:** if you use this plugin, leave Omarchy's night
+> light alone, and unbind its key (see [Keybindings](#keybindings)).
 
 ## Install
 
@@ -74,7 +90,8 @@ dependency:
 | Gesture | What it does |
 |---|---|
 | left click | open the panel |
-| right click | turn the filter on everywhere it is saved, or off everywhere |
+| right click | turn the filter on everywhere (a screen saved at `0` is
+  left alone; one with nothing saved yet lights up at 40%), or off everywhere |
 | scroll | raise/lower every screen by 5 points |
 
 In the panel, each screen gets its own row: a switch to turn that screen's
@@ -139,21 +156,33 @@ Output names are the ones `hyprctl monitors` prints (`DP-2`, `HDMI-A-1`, …).
 
 ### Keybindings
 
-Add to `~/.config/hypr/bindings.conf` (or `bindings.lua` on Omarchy 4):
+Omarchy 4 configures Hyprland in Lua. Add to `~/.config/hypr/bindings.lua`:
 
+```lua
+-- SUPER + CTRL + N is an Omarchy default, bound to `omarchy-toggle-nightlight`
+-- (hyprsunset). Leave it in place and both fire: hyprsunset starts, claims the
+-- gamma control, and this plugin silently stops working for the session. Unbind
+-- it first -- that is Omarchy's documented way to replace a default.
+hl.unbind("SUPER + CTRL + N")
+
+o.bind("SUPER + CTRL + MINUS", "Night light down", "omarchy-nightlight -5")
+o.bind("SUPER + CTRL + EQUAL", "Night light up", "omarchy-nightlight +5")
+o.bind("SUPER + CTRL + N", "Night light", "omarchy-nightlight toggle")
 ```
-bindd = SUPER CTRL, minus, Night light down, exec, omarchy-nightlight -5
-bindd = SUPER CTRL, equal, Night light up,   exec, omarchy-nightlight +5
-bindd = SUPER CTRL, N,     Night light,      exec, omarchy-nightlight toggle
-```
+
+`SUPER + CTRL + MINUS` and `SUPER + CTRL + EQUAL` are free on a stock Omarchy 4
+and need no unbind.
+
+These need the optional installer above, which puts `omarchy-nightlight` on your
+`PATH`. Without it, use the full path to the CLI inside the plugin folder.
 
 ### At login
 
 The daemon starts on demand, but the saved temperatures need re-applying once
-per session. Add this to your autostart:
+per session. Add this to `~/.config/hypr/autostart.lua`:
 
-```
-omarchy-nightlight restore
+```lua
+o.launch_on_start("omarchy-nightlight restore")
 ```
 
 `restore` only touches outputs that have a line in the config file, so the same
@@ -191,7 +220,8 @@ opposite of what most people install this for.
 
 ## Configuration
 
-`~/.config/omarchy/nightlight.conf`, one `output=percent` line per screen:
+`~/.config/omarchy/nightlight.conf`, one `output=percent` line per screen, plus an
+`output.brightness=percent` line for any screen you dimmed:
 
 ```
 DP-2=40
@@ -205,8 +235,10 @@ is why `off` erases nothing and `on` can bring everything back.
 <summary>Why a file instead of inline settings in <code>shell.json</code></summary>
 
 Omarchy's rule is that plugin settings live inline on the bar entry in
-`shell.json`, and this plugin follows it for everything that is a setting: the
-one option it has (`command`) is read with `setting()` from that entry.
+`shell.json`, and this plugin follows it for everything that is a setting. All
+of them are read with `setting()` from that entry: `command`, `nightPercent`,
+`scheduleEnabled`, `scheduleOnAt`, `scheduleOffAt` and `pausedUntil` — the last
+four written back by the panel itself.
 
 The saved percentages are not a setting, they are backend state, and they have
 to survive the shell being down. `omarchy-nightlight restore` runs at login
@@ -218,7 +250,7 @@ depend on the very component it has to work without.
 </details>
 
 **A screen saved at `0` is deliberately neutral.** Global commands
-(`omarchy-nightlight on`, `+5`, the scroll gesture, the **All** button) skip it,
+(`omarchy-nightlight on`, `+5`, the scroll gesture, the master switch) skip it,
 so a portrait monitor you keep clean stays clean. Naming the output explicitly
 (`omarchy-nightlight HDMI-A-1 30`, or its slider in the panel) still works —
 that is how you change your mind.
@@ -234,9 +266,14 @@ the plugin does. Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
   "icon": "󰔎",
   "label": "Nightlight",
   "action": "omarchy-nightlight toggle",
-  "checked": "omarchy-nightlight --json | jq -e '.outputs|any(.on)'"
+  "checked": "omarchy-nightlight --json --no-start | jq -e '.outputs|any(.on)'"
 }
 ```
+
+`--no-start` is not optional here. Omarchy evaluates every `checked` expression
+each time the menu opens, not when the row is drawn — without the flag, pressing
+`SUPER + SPACE` for anything at all would start `wl-gammarelay-rs` and take the
+gamma control.
 
 Needs `omarchy-nightlight` on your `PATH` (see the optional installer above) and
 `jq` for the `checked` expression. Remove the block by hand if you uninstall.
@@ -268,22 +305,37 @@ it — the ramp is only held while the daemon is alive:
 pkill wl-gammarelay-rs
 ```
 
-or just log out and back in. The daemon runs inside the Hyprland session scope,
-so it dies with the session and the screens come back on their own.
+or just log out and back in — the ramp goes with the Wayland connection either
+way. Where `uwsm-app` is available the daemon is launched into the compositor's
+own systemd scope and dies with the session; on the fallback path it is a plain
+detached process, so logging out still clears the screens, but not because the
+process was in the session scope.
 
-`omarchy plugin remove` only deletes the plugin folder — it never runs anything
-from the plugin. Whatever you added by hand is still yours to remove:
+`omarchy plugin remove` never runs anything from the plugin. It removes the
+folder — or, for a folder that is not a git clone, renames it to
+`.<id>.bak.<timestamp>` beside itself — and disables the widget in `shell.json`.
+Whatever you added by hand is still yours to remove:
 
 ```bash
 rm -f ~/.local/bin/omarchy-nightlight        # only if you ran install.sh
+                                             # ($XDG_BIN_HOME instead, if set)
 rm -f ~/.config/omarchy/nightlight.conf      # your saved percentages
 ```
 
+Two lock files live in `$XDG_RUNTIME_DIR` (`omarchy-nightlight.lock` and
+`omarchy-nightlight.daemon.lock`). They are empty, and the runtime directory is
+wiped at logout, so there is nothing to clean up — they are listed only so
+nothing found on the machine is unaccounted for. If you run the CLI over SSH
+with no `$XDG_RUNTIME_DIR` set, they fall back to `/tmp` under the same names
+and are yours to delete. On a machine with more than one human, that fallback
+name belongs to whoever ran the CLI first, and the second person's saves will
+quietly stop persisting until it is removed.
+
 Also check, if you set them up:
 
-- the `omarchy-nightlight restore` line in your autostart — left behind it
-  points at a dead symlink and fails quietly at every login
-- any keybindings in `~/.config/hypr/bindings.conf` (or `bindings.lua`)
+- the `omarchy-nightlight restore` line in `~/.config/hypr/autostart.lua` —
+  left behind it points at a dead symlink and fails quietly at every login
+- any keybindings you added to `~/.config/hypr/bindings.lua`
 - the menu block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`
 - the widget's entry in `~/.config/omarchy/shell.json`, including any
   `scheduleEnabled` / `scheduleOnAt` / `scheduleOffAt` / `pausedUntil` settings

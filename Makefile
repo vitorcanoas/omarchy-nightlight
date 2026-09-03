@@ -24,14 +24,29 @@ lint:
 # symlink because omarchy-plugin-validate refuses symlinks inside a plugin.
 dev:
 	@test -f manifest.json || { printf 'run make dev from the plugin repo root\n' >&2; exit 1; }
-	# rsync --delete on the wrong PLUGIN_DIR would empty it. $$HOME or a bare
-	# path is never a plugin directory, and the cost of being wrong here is
-	# someone's home directory.
-	@case "$(PLUGIN_DIR)" in \
-	  */omarchy/plugins/*) ;; \
-	  *) printf 'refusing to sync to %s: PLUGIN_DIR must be under omarchy/plugins/\n' "$(PLUGIN_DIR)" >&2; exit 1 ;; \
-	esac
-	@mkdir -p "$(PLUGIN_DIR)"
-	rsync -a --delete --exclude '.git/' --exclude '.lint/' ./ "$(PLUGIN_DIR)/"
-	omarchy-shell -q shell rescanPlugins
-	@printf 'synced to %s\n' "$(PLUGIN_DIR)"
+	# rsync --delete on the wrong PLUGIN_DIR would empty it, and the cost of
+	# being wrong is someone else's installed plugins. Matching "contains
+	# /omarchy/plugins/" was not enough: a trailing slash or a "/." component --
+	# exactly what a person types for a directory -- left PLUGIN_DIR pointing at
+	# the plugins directory ITSELF, where --delete wipes every sibling plugin.
+	# So normalise those away first, then demand the path be one level below
+	# plugins/ and nothing else.
+	@dir='$(PLUGIN_DIR)'; \
+	while :; do \
+	  case "$$dir" in \
+	    */.) dir=$${dir%/.} ;; \
+	    */) dir=$${dir%/} ;; \
+	    *) break ;; \
+	  esac; \
+	done; \
+	case "$${dir%/*}" in \
+	  */omarchy/plugins) ;; \
+	  *) printf 'refusing to sync to %s: PLUGIN_DIR must name a directory directly under omarchy/plugins/\n' "$$dir" >&2; exit 1 ;; \
+	esac; \
+	case "$${dir##*/}" in \
+	  ''|.|..) printf 'refusing to sync to %s: that is the plugins directory itself, not a plugin\n' "$$dir" >&2; exit 1 ;; \
+	esac; \
+	mkdir -p "$$dir"; \
+	rsync -a --delete --exclude '.git/' --exclude '.lint/' ./ "$$dir/" || exit 1; \
+	omarchy-shell -q shell rescanPlugins; \
+	printf 'synced to %s\n' "$$dir"

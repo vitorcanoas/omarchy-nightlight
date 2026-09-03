@@ -151,6 +151,21 @@ Panel {
     }
   }
 
+  // A write on ANY instance invalidates a read in flight on any other: the
+  // reader publishes its result to every peer, so a per-instance epoch left the
+  // whole bug alive on a two-monitor machine -- the owner's background poll
+  // would happily overwrite a switch the user had just flipped on the other
+  // screen. Bumped the same way pauses and schedule phases are.
+  function publishWrite() {
+    var items = peers()
+    for (var i = 0; i < items.length; i++) {
+      var peer = items[i]
+      if (peer && typeof peer.adoptWrite === "function") peer.adoptWrite()
+    }
+  }
+
+  function adoptWrite() { root.stateEpoch++ }
+
   function publishError(message) {
     var items = peers()
     for (var i = 0; i < items.length; i++) {
@@ -168,6 +183,19 @@ Panel {
     // life. The CLI could set that off by itself: a busctl hiccup used to drop
     // an output for a single poll and flip the signature.
     if (root.busy) return
+
+    // A daemon that is not running is not the same as a machine with no
+    // screens. With --no-start the poll reports zero outputs plus a warning,
+    // and wiping the list on that left the panel stuck at "No screens" with
+    // nothing left to click -- the poll used to heal itself by starting the
+    // daemon, and deliberately no longer does. Keep the last known screens and
+    // let the warning do the explaining.
+    if (names.length === 0 && String(warning || "") !== "" && root.names.length > 0) {
+      root.stateLoaded = true
+      root.errorText = ""
+      root.warningText = String(warning)
+      return
+    }
 
     // The output list applies whenever it really changed -- a monitor plugged
     // or unplugged -- and only then, so the delegates stay put otherwise.
@@ -194,8 +222,44 @@ Panel {
   }
 
   // ---- reading ------------------------------------------------------------
+  //
+  // `stateEpoch` ties a read's result to the world it was started in. Every
+  // write bumps it; a read carries the value it saw at launch and its result is
+  // discarded if the epoch moved while it was in flight. Without that, a poll
+  // that started 50ms BEFORE the user flipped a switch came back 200ms after
+  // the apply had finished, `busy` was false again, and adoptState installed
+  // the pre-toggle state -- the switch visibly flipped itself back, and stayed
+  // wrong until the next poll: 2s with the panel open, up to 20s with it shut.
+  property int stateEpoch: 0
+  property int stateReadEpoch: -1
+
+  // A refresh asked for while a read is already running used to be dropped
+  // outright, which is exactly what swallowed the confirming refresh after an
+  // apply. Remember it and run it as soon as the current read lands.
+  property bool refreshQueued: false
+
+  // Quickshell gives no ordering guarantee between Process.exited and
+  // StdioCollector.streamFinished. Draining the queued refresh from exited
+  // alone let the NEXT read start and move stateReadEpoch before the finished
+  // read's text had even been looked at -- so the stale text was then compared
+  // against the new read's epoch and sailed straight through the guard written
+  // to catch it. Both signals have to land before anything relaunches.
+  property bool readStreamDone: false
+
   function refresh() {
-    if (!stateProc.running) stateProc.running = true
+    if (stateProc.running) { root.refreshQueued = true; return }
+    root.refreshQueued = false
+    root.stateReadEpoch = root.stateEpoch
+    root.readStreamDone = false
+    stateProc.running = true
+    root.armWatchdog()
+  }
+
+  // Called from both of the read's end signals; acts only once both have landed.
+  function finishRead() {
+    if (stateProc.running || !root.readStreamDone) return
+    root.armWatchdog()
+    if (root.refreshQueued) Qt.callLater(root.refresh)
   }
 
   // While the user is working the controls, a read must not take them back.
@@ -262,11 +326,23 @@ Panel {
 
   // Called once at startup. A pause that expired while the shell was down ends
   // immediately; one still running is picked back up with its remaining time.
+  // A bar surface is built per monitor, so this runs once per screen. Only the
+  // expired branch acts on the machine, and it must act once: unguarded, two
+  // monitors meant two `omarchy-nightlight on` processes and two independent
+  // shell.json rewrites at every login, each snapshotting `settings` on its own
+  // and able to drop the other's keys. Publishing the resumed pause is
+  // per-instance state and stays unguarded.
   function resumePauseFromSettings() {
     var stored = Number(setting("pausedUntil", 0)) || 0
     if (stored <= 0) return
     if (Date.now() >= stored) {
+      // Every instance clears its own snapshot; only the owner acts on the
+      // machine. Gating persist() as well left the peers holding the expired
+      // timestamp, and the next persist() from one of them -- a schedule edit,
+      // say -- wrote it straight back to shell.json, resurrecting a pause that
+      // had ended days earlier.
       persist({ pausedUntil: 0 })
+      if (!root.isPollOwner()) return
       run(["on"])
       return
     }
@@ -351,7 +427,12 @@ Panel {
   }
 
   function setScheduleEnabled(value) {
-    root.schedulePhase = ""
+    // publishPhase, not a local write. The timer's first tick runs on the poll
+    // owner, and clearing the phase only here left the owner still holding the
+    // old one -- so re-enabling the schedule from a non-owner's panel hit
+    // applySchedule's `phase === schedulePhase` guard and did nothing at all.
+    // The schedule looked dead until the next boundary hours later.
+    root.publishPhase("")
     persist({ scheduleEnabled: value === true })
     // No explicit apply here. The schedule timer has triggeredOnStart, so
     // `scheduleEnabled` turning true starts it and fires immediately -- and
@@ -370,7 +451,10 @@ Panel {
     var next = {}
     next[key] = Model.formatTime(Model.parseTime(value))
     persist(next)
-    root.schedulePhase = ""
+    // Published, not local: applySchedule(true) below usually repairs the
+    // divergence, but it early-returns when the schedule is off or paused, and
+    // then this instance holds "" while the owner still holds the old phase.
+    root.publishPhase("")
     Qt.callLater(function() { root.applySchedule(true) })
   }
 
@@ -403,8 +487,14 @@ Panel {
   // genuinely does supersede an older one.
   readonly property string globalQueueKey: "\u0000global"
 
+  // Keyed by output AND axis. On the output alone, a queued
+  // `["DP-2","brightness","55"]` was replaced by a later `["DP-2","70"]`, so
+  // releasing the brightness slider and then nudging the intensity slider
+  // within the same ~200ms run dropped the brightness write entirely -- the
+  // panel showed 55 until the next read snapped it back.
   function queueKeyFor(args) {
-    if (args.length > 1 && root.byName[args[0]] !== undefined) return args[0]
+    if (args.length > 1 && root.byName[args[0]] !== undefined)
+      return args[0] + "\u0000" + (args[1] === "brightness" ? "brightness" : "percent")
     return root.globalQueueKey
   }
 
@@ -417,8 +507,12 @@ Panel {
       return
     }
     root.queuedByOutput = ({})
+    // Any read already in flight, here or on another monitor's instance,
+    // predates this write; mark them all stale.
+    root.publishWrite()
     applyProc.command = [root.command].concat(args)
     applyProc.running = true
+    root.armWatchdog()
   }
 
   // Pull one queued command, oldest key first. The rest stay queued and go out
@@ -449,7 +543,18 @@ Panel {
   // Applying a percentage always names the output. A command without a name
   // skips outputs deliberately saved at 0%, so a slider on one of those would
   // otherwise do nothing at all.
+  // A screen can be unplugged between the gesture and the command: the slider
+  // release, the keyboard nudge and the per-screen switch all reach the CLI
+  // with a name the daemon may no longer know, and its non-zero exit paints an
+  // error banner across every screen for something the user did nothing wrong
+  // to cause. (The debounce path cannot hit this -- `busy` freezes `names`
+  // while a drag is live -- so the guard belongs here, on the commits.)
+  function outputGone(name) {
+    return root.names.indexOf(name) === -1
+  }
+
   function applyPercent(name, value) {
+    if (root.outputGone(name)) return
     var target = Model.clampPercent(value)
     setPending(name, target, target > 0)
     run([name, String(target)])
@@ -504,6 +609,7 @@ Panel {
   }
 
   function applyBrightness(name, value) {
+    if (root.outputGone(name)) return
     var target = Model.clampBrightness(value)
     setPendingBrightness(name, target)
     run([name, "brightness", String(target)])
@@ -521,6 +627,7 @@ Panel {
   }
 
   function toggleScreen(name) {
+    if (root.outputGone(name)) return
     var turningOn = !isOn(name)
     var saved = savedFor(name)
     // What the CLI will light it up at, mirrored here so the knob and the
@@ -746,10 +853,19 @@ Panel {
   // while it waits for the daemon, which is exactly the hyprsunset-conflict case
   // the warning exists for. Same shape as the Tailscale service's pollWatchdog,
   // for the same reason: a panel that silently stops refreshing stays stopped.
+  //
+  // It measures the CURRENT invocation: it is restarted whenever a process
+  // starts, and stopped when none is left. Free-running on wall-clock phase, it
+  // killed whatever happened to be in flight at the tick -- so the real timeout
+  // was anywhere from 0 to 15s, and a healthy apply issued 100ms before a tick
+  // was SIGTERMed with its queue thrown away, snapping the switch back under
+  // the user. On a fresh install, where the CLI legitimately waits ~4s for the
+  // daemon, that window is wide.
   Timer {
+    id: procWatchdog
     interval: 15000
-    running: true
-    repeat: true
+    running: false
+    repeat: false
     onTriggered: {
       if (stateProc.running) stateProc.running = false
       if (applyProc.running) {
@@ -759,6 +875,36 @@ Panel {
         root.queuedByOutput = ({})
         root.pending = ({})
       }
+
+      // A process that ignored the kill -- SIGTERM swallowed, or wedged on a
+      // dead bus -- leaves `running` true. With repeat:false and nothing here,
+      // the timer stopped and the widget stayed wedged with no further attempt.
+      if (stateProc.running || applyProc.running) {
+        procWatchdog.restart()
+        return
+      }
+
+      // The read that was killed will never deliver a stream, so release the
+      // gate and go get a fresh one rather than sitting on stale state.
+      root.readStreamDone = true
+      root.refreshQueued = false
+      Qt.callLater(root.refresh)
+    }
+  }
+
+  // Arm on the launch that needs watching and leave it alone after that.
+  //
+  // restart() here was worse than the bug it replaced: with the panel open a
+  // refresh lands every 2s, well inside the 15s deadline, so every poll pushed
+  // the deadline out ahead of a hung apply -- forever. `busy` stayed true, the
+  // panel froze on its optimistic values and never recovered. The shell's own
+  // Tailscale poll watchdog documents this exact trap and does the same thing
+  // this now does.
+  function armWatchdog() {
+    if (stateProc.running || applyProc.running) {
+      if (!procWatchdog.running) procWatchdog.start()
+    } else {
+      procWatchdog.stop()
     }
   }
 
@@ -775,18 +921,33 @@ Panel {
 
   Process {
     id: stateProc
-    command: [root.command, "--json"]
+    // --no-start is not optional here, it is the whole promise of the plugin:
+    // merely having the widget enabled must not start wl-gammarelay-rs and must
+    // not take the Wayland gamma control away from whatever holds it. Without
+    // the flag this poll ran ensure_daemon every 20s, so within 20 seconds of
+    // enabling the widget a daemon nobody asked for claimed every output --
+    // and Omarchy's own `omarchy toggle nightlight` (hyprsunset) silently
+    // stopped working for the rest of the session, for a user who never even
+    // opened the panel. The daemon starts on the first real request instead.
+    command: [root.command, "--json", "--no-start"]
     stdout: StdioCollector {
       id: stateOut
       waitForEnd: true
       onStreamFinished: {
+        root.readStreamDone = true
         var state = Model.parseState(text)
-        if (!state) return // unusable output: keep the last good state
+        if (!state) { root.finishRead(); return } // unusable: keep last good state
+        // Written to since this read began: it describes a world that no longer
+        // exists. Drop it; the queued refresh below fetches the real one.
+        if (root.stateReadEpoch !== root.stateEpoch) { root.finishRead(); return }
         root.publishState(state.names, state.byName, state.warning)
+        root.finishRead()
       }
     }
     stderr: StdioCollector { id: stateErr; waitForEnd: true }
     onExited: function(exitCode) {
+      root.armWatchdog()
+      root.finishRead()
       if (exitCode === 0) return
       // Missing dependency, dead daemon, hyprsunset holding the outputs: the
       // CLI explains itself on stderr, so show that rather than a silent
@@ -809,6 +970,7 @@ Panel {
         root.run(next)
         return
       }
+      root.armWatchdog()
       root.refresh()
     }
   }

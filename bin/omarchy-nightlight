@@ -51,6 +51,18 @@ CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/nightlight.conf"
 # lock file out of the user's config folder where it would look like ours to
 # keep and theirs to wonder about.
 LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-nightlight.lock"
+
+# A second lock, held only while starting the daemon. Separate from the config
+# lock on purpose: they protect unrelated things and a shared one would make an
+# invocation that is merely waiting for the daemon block someone else's write.
+DAEMON_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-nightlight.daemon.lock"
+
+# The temp file is named from our PID, so this reaches it from anywhere. A
+# RETURN trap inside the writing function was not enough: RETURN fires on a
+# function returning, and the widget does not wait for that -- its watchdog
+# SIGTERMs this process outright, which is exactly the case that used to strand
+# `nightlight.conf.tmp.<pid>` in the user's config folder forever.
+trap 'rm -f "$CONF.tmp.$$"' EXIT INT TERM
 SERVICE="rs.wl-gammarelay"
 IFACE="rs.wl.gammarelay"
 NEUTRAL=6500       # 0% on the Windows scale
@@ -96,28 +108,85 @@ ensure_daemon() {
 
   command -v wl-gammarelay-rs >/dev/null 2>&1 || return 1
 
-  # A daemon that is already running but has not claimed the bus name is not
-  # going to be helped by starting another one -- it is being blocked, almost
-  # always by hyprsunset holding the outputs. Launching a second copy every time
-  # anyone runs this command would pile up processes for the whole session.
-  pgrep -x wl-gammarelay-rs >/dev/null 2>&1 && return 1
+  # Serialise from here down. The pgrep below is a check-then-act, and the
+  # window is not sub-millisecond: uwsm-app is a shell client that hands the
+  # launch to a session daemon over FIFOs, so for the whole round trip no
+  # process named wl-gammarelay-rs exists for pgrep to find. Two invocations
+  # landing together -- an autostart `restore` and the user's first keybinding
+  # -- both passed the check and both asked for a daemon, and the loser could
+  # claim neither the bus name nor the gamma control.
+  # The braces keep the stderr suppression on the exec alone -- redirections are
+  # applied left to right, so `exec 8>... 2>/dev/null` would have let the error
+  # through and then made it permanent.
+  if { exec 8>"$DAEMON_LOCK"; } 2>/dev/null; then
+    # A failed flock is not fatal: worst case we are unserialised, which is
+    # where we started. Blocking a keybinding on it would be worse.
+    flock -w 10 8 2>/dev/null
+  fi
+
+  # Whoever we queued behind may have started it while we waited.
+  busctl --user status "$SERVICE" >/dev/null 2>&1 && { exec 8>&- 2>/dev/null; return 0; }
+
+  # `wl-gammarelay-rs?` with the trailing s optional, because the name is 16
+  # characters and the kernel truncates comm to 15: `pgrep -x wl-gammarelay-rs`
+  # matches NOTHING, ever. Every guard built on it was dead code -- this branch
+  # never ran, so a second daemon was spawned on top of a blocked one, and
+  # daemon_problem could never reach the message it has for that case.
+  # A running daemon that has not claimed the bus name may be blocked -- almost
+  # always hyprsunset holding the outputs -- or may simply be 80ms old. This
+  # used to return 1 immediately, so a second keypress during startup died with
+  # "something else may hold the gamma control" on a machine where nothing was
+  # wrong. Telling the two apart costs one bounded wait.
+  local rc
+  if pgrep -x 'wl-gammarelay-rs?' >/dev/null 2>&1; then
+    # Only wait when the cause could be youth. A daemon blocked by hyprsunset is
+    # not going to claim the bus in four seconds or in four hours, and paying
+    # that wait on every keypress of a permanently conflicted machine helps
+    # nobody -- daemon_problem already names hyprsunset in that case.
+    if pgrep -x hyprsunset >/dev/null 2>&1; then
+      rc=1
+    else
+      wait_for_bus
+      rc=$?
+    fi
+    exec 8>&- 2>/dev/null
+    return $rc
+  fi
 
   # Prefer uwsm-app so the daemon lands in the compositor's own systemd scope
   # and dies with the session; fall back to a bare setsid where uwsm is absent.
+  # 8>&- is load-bearing. Without it the daemon inherits the open lock file
+  # description and holds the exclusive lock for its entire life, so the NEXT
+  # invocation blocks on the daemon -- not on us -- for the full flock timeout,
+  # then proceeds unserialised anyway. That turned a millisecond race into a
+  # ten-second stall that still did not serialise.
   if command -v uwsm-app >/dev/null 2>&1; then
-    setsid uwsm-app -- wl-gammarelay-rs >/dev/null 2>&1 &
+    setsid uwsm-app -- wl-gammarelay-rs >/dev/null 2>&1 8>&- &
   else
-    setsid wl-gammarelay-rs >/dev/null 2>&1 &
+    setsid wl-gammarelay-rs >/dev/null 2>&1 8>&- &
   fi
 
-  # Backoff rather than 25 flat polls: a daemon that is going to come up does so
-  # in well under a second, and one that is not should not cost three more
-  # seconds of a blocked terminal on every single call.
-  local wait=0.1
+  wait_for_bus
+  rc=$?
+  exec 8>&- 2>/dev/null
+  return $rc
+}
+
+# Bounded backoff waiting for the bus name: a daemon that is going to come up
+# does so in well under a second, and one that is not should not cost three more
+# seconds of a blocked terminal on every call. Six steps, ~4.1s total.
+#
+# Milliseconds as integers, not an awk float. awk's `print` formats according to
+# LC_NUMERIC, so under a comma-decimal locale the delay came out as "0,18",
+# `sleep` rejected it, and -- with no `set -e` and the status discarded -- the
+# loop spun through all six iterations with no delay at all, reporting that a
+# daemon which needed 300ms "would not start".
+wait_for_bus() {
+  local ms=100
   for _ in {1..6}; do
-    sleep "$wait"
+    LC_ALL=C sleep "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))" || return 1
     busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
-    wait=$(awk "BEGIN{print $wait * 1.8}")
+    ms=$(( ms * 18 / 10 ))
   done
   return 1
 }
@@ -128,7 +197,7 @@ daemon_problem() {
     printf 'wl-gammarelay-rs is not installed. Install it with: yay -S wl-gammarelay-rs'
   elif pgrep -x hyprsunset >/dev/null 2>&1; then
     printf 'hyprsunset is holding the Wayland gamma control, so wl-gammarelay-rs cannot start. Stop it: pkill hyprsunset'
-  elif pgrep -x wl-gammarelay-rs >/dev/null 2>&1; then
+  elif pgrep -x 'wl-gammarelay-rs?' >/dev/null 2>&1; then
     printf 'wl-gammarelay-rs is running but has not claimed its bus name. Something else may hold the gamma control.'
   elif (( NO_START )); then
     printf 'wl-gammarelay-rs is not running.'
@@ -231,7 +300,12 @@ save_brightness_pct() { save_key "$1.brightness" "$2"; }
 save_key() {
   local out=$1 pct=$2
   mkdir -p "$(dirname "$CONF")"
-  ( flock 9 || exit 1
+  # -w rather than a bare flock: a writer wedged while holding the lock used to
+  # block every later invocation forever. The widget has a 15s watchdog for that
+  # (see Panel.qml), but a keybinding has nothing and simply hangs. Five seconds
+  # is far longer than an honest write takes, and it ends.
+  ( flock -w 5 9 || exit 1
+    trap 'rm -f "$CONF.tmp.$$"' EXIT
     save_key_locked "$out" "$pct"
   ) 9>"$LOCK"
 }
@@ -262,26 +336,83 @@ EOF
   # exit 0, "success" printed, every other screen's setting gone. `mv` only
   # needs write permission on the directory, so it had no trouble doing it.
   local tmp="$CONF.tmp.$$"
-  if grep -qE "^\s*$out\s*=" "$CONF" 2>/dev/null; then
-    sed -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  else
-    { cat "$CONF" && printf '%s=%s\n' "$out" "$pct"; } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  fi
+
+  # awk rather than sed, for three reasons the sed version got wrong:
+  #
+  #  - It rewrites the VALUE and keeps anything the user wrote after it. A
+  #    whole-line replace ate trailing comments, and the header above invites
+  #    hand-editing; worse, the size guard below then read that shrink as data
+  #    loss and refused every future save, permanently.
+  #  - It replaces the value whatever the value looks like. The old pair
+  #    disagreed with itself -- grep decided the key existed on `key\s*=`, sed
+  #    only rewrote a value matching `[0-9]+` -- so `DP-2=` or `DP-2=abc` made
+  #    sed copy the file verbatim and exit 0. save_key reported success having
+  #    written nothing, and the setting silently vanished at the next login.
+  #  - It appends through a record, so a config with no trailing newline gets
+  #    one instead of producing `DP-2=40DP-9=30`, which no reader could parse.
+  #
+  # Every matching line is rewritten, not just the first: leaving a stale
+  # duplicate behind would make the read-back below disagree with itself.
+  awk -v key="$out" -v val="$pct" '
+    BEGIN { pat = "^[ \t]*" key "[ \t]*=" ; found = 0 }
+    {
+      if ($0 ~ pat) {
+        found = 1
+        match($0, pat)
+        head = substr($0, 1, RLENGTH)
+        rest = substr($0, RLENGTH + 1)
+        hash = index(rest, "#")
+        if (hash > 0) print head val " " substr(rest, hash)
+        else print head val
+        next
+      }
+      print
+    }
+    END { if (!found) print key "=" val }
+  ' "$CONF" >"$tmp" 2>/dev/null || return 1
 
   # A temp file smaller than the original means content was lost on the way,
   # whatever the exit codes said. Refuse rather than promote it.
   local old_size new_size
-  old_size=$(wc -c <"$CONF" 2>/dev/null) || { rm -f "$tmp"; return 1; }
-  new_size=$(wc -c <"$tmp" 2>/dev/null) || { rm -f "$tmp"; return 1; }
+  old_size=$(wc -c <"$CONF" 2>/dev/null) || return 1
+  new_size=$(wc -c <"$tmp" 2>/dev/null) || return 1
   if (( new_size < old_size - 8 )); then
-    rm -f "$tmp"
     return 1
   fi
 
-  mv -f "$tmp" "$CONF" || { rm -f "$tmp"; return 1; }
+  # Read the value back out of the temp before promoting it. If what we are
+  # about to install does not say what we were asked to write, nothing else in
+  # here gets to call this a success.
+  #
+  # awk again, not `grep -oP`: the read path already degrades where grep is
+  # built without PCRE, and asserting with -P here would have turned that
+  # degradation into a hard failure of every save on such a machine.
+  local written
+  written=$(awk -v key="$out" '
+    BEGIN { pat = "^[ \t]*" key "[ \t]*=[ \t]*" ; v = "" }
+    $0 ~ pat { line = $0; sub(pat, "", line); sub(/[^0-9].*$/, "", line); v = line }
+    END { print v }
+  ' "$tmp" 2>/dev/null)
+  [[ $written == "$pct" ]] || return 1
+
+  mv -f "$tmp" "$CONF" || return 1
 }
 
 # ---------------------------------------------------------------------------
+# Neutralise one output and REPORT it if the write did not land. `off`,
+# `toggle`, `reset` and `restore` used to call set_kelvin bare and discard its
+# status, so with the daemon dead or an output unplugged they printed their OSD,
+# printed a state table built from reads that had failed too, and exited 0 with
+# the screen still amber. `reset` is the documented way to un-tint your screens
+# before deleting the plugin -- it lying is the worst version of this bug.
+go_neutral() {
+  set_kelvin "$1" "$NEUTRAL" || {
+    warn "could not neutralise $1"
+    FAILED=1
+    return 1
+  }
+}
+
 is_on() {
   local k; k=$(kelvin_of "$1")
   [[ -n $k ]] && (( k < ON_BELOW ))
@@ -566,14 +697,17 @@ case "$ACTION" in
     # light nothing is applied and the autostart line stays harmless — that is
     # what lets you version one autostart across every machine.
     for o in "${TARGETS[@]}"; do
-      b=$(brightness_in_file "$o") && set_brightness "$b" "$o"
+      b=$(brightness_in_file "$o") && { set_brightness "$b" "$o" || { warn "could not set brightness on $o"; FAILED=1; }; }
       p=$(pct_in_file "$o") || continue
       # A screen written as 0 is meant to be neutral, so say so rather than
       # leaving whatever ramp happened to be loaded. At login that is already
       # true and this is a no-op; run by hand after an `on` it is the difference
       # between "restored the file" and "restored most of the file".
-      if (( p > 0 )); then set_kelvin "$o" "$(pct_to_kelvin "$p")"
-      else set_kelvin "$o" "$NEUTRAL"; fi
+      if (( p > 0 )); then
+        set_kelvin "$o" "$(pct_to_kelvin "$p")" || { warn "could not set the temperature on $o"; FAILED=1; }
+      else
+        go_neutral "$o"
+      fi
     done ;;
 
   on)
@@ -587,7 +721,7 @@ case "$ACTION" in
     show ;;
 
   off)
-    for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
+    for o in "${TARGETS[@]}"; do go_neutral "$o"; done
     osd 0 "Night light off"
     show ;;
 
@@ -597,7 +731,7 @@ case "$ACTION" in
     any=0
     for o in "${TARGETS[@]}"; do is_on "$o" && any=1; done
     if (( any )); then
-      for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
+      for o in "${TARGETS[@]}"; do go_neutral "$o"; done
       osd 0 "Night light off"
     else
       osd_pct=""
@@ -617,8 +751,8 @@ case "$ACTION" in
     # with the folder, and the daemon keeps applying the last ramp it was given.
     # Nothing is saved, so the chosen intensities survive for a later `on`.
     for o in "${TARGETS[@]}"; do
-      set_kelvin "$o" "$NEUTRAL"
-      set_brightness 100 "$o"
+      go_neutral "$o"
+      set_brightness 100 "$o" || { warn "could not restore brightness on $o"; FAILED=1; }
     done
     osd 0 "Night light reset"
     show ;;
