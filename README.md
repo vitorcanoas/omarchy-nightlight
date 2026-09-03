@@ -55,6 +55,12 @@ omarchy plugin add https://github.com/vitorcanoas/omarchy-nightlight.git --enabl
 That is all the bar widget needs — it calls the CLI inside the plugin folder by
 absolute path, so nothing has to be on your `PATH`.
 
+**Installing it does not change your screens.** The widget reads with
+`--no-start`, so simply enabling it never launches `wl-gammarelay-rs` and never
+takes the Wayland gamma control away from whatever already holds it. The daemon
+starts the first time you actually ask for something — a switch, a slider, a
+keybinding. Until then the panel just tells you it is not running.
+
 If you also want the command in a terminal or bound to a key, run the optional
 installer once. It symlinks the CLI into `~/.local/bin` and checks the
 dependency:
@@ -118,6 +124,7 @@ omarchy-nightlight off             # everything neutral
 omarchy-nightlight DP-2 off        # only DP-2 neutral
 omarchy-nightlight on              # restore the saved percentages
 omarchy-nightlight toggle          # off if anything is on, else on
+omarchy-nightlight reset           # neutral white and full brightness, everywhere
 omarchy-nightlight restore         # re-apply the saved file (use at login)
 omarchy-nightlight --json          # machine-readable state
 
@@ -242,26 +249,45 @@ separate programs is not linking. Nothing here is derived from its source.
 
 ## Uninstall
 
-Set your screens back to neutral first — removing the plugin does not, and a
-forgotten filter is confusing later:
+**Put your screens back first.** Removing the plugin deletes the CLI along with
+it, and `wl-gammarelay-rs` keeps applying whatever ramp it was last given — a
+dimmed or warm screen with nothing left on disk to explain it or undo it.
 
 ```bash
-omarchy-nightlight off
+~/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight reset
 omarchy plugin remove vitorcanoas.nightlight
 ```
 
-`omarchy plugin remove` only deletes the plugin folder. It never runs anything
-from the plugin, so two things it cannot clean up are left behind, both
-harmless and both one command:
+The full path matters: `install.sh` is optional, so on a default install
+`omarchy-nightlight` is not on your `PATH`.
+
+If you already removed the plugin and a screen is stuck, either of these fixes
+it — the ramp is only held while the daemon is alive:
+
+```bash
+pkill wl-gammarelay-rs
+```
+
+or just log out and back in. The daemon runs inside the Hyprland session scope,
+so it dies with the session and the screens come back on their own.
+
+`omarchy plugin remove` only deletes the plugin folder — it never runs anything
+from the plugin. Whatever you added by hand is still yours to remove:
 
 ```bash
 rm -f ~/.local/bin/omarchy-nightlight        # only if you ran install.sh
 rm -f ~/.config/omarchy/nightlight.conf      # your saved percentages
 ```
 
-Remove the bar entry from `~/.config/omarchy/shell.json` too if you added it by
-hand rather than with `omarchy plugin enable`, and the menu block from
-`~/.config/omarchy/extensions/omarchy-menu.jsonc` if you pasted one.
+Also check, if you set them up:
+
+- the `omarchy-nightlight restore` line in your autostart — left behind it
+  points at a dead symlink and fails quietly at every login
+- any keybindings in `~/.config/hypr/bindings.conf` (or `bindings.lua`)
+- the menu block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`
+- the widget's entry in `~/.config/omarchy/shell.json`, including any
+  `scheduleEnabled` / `scheduleOnAt` / `scheduleOffAt` / `pausedUntil` settings
+  the panel saved onto it
 
 ## Troubleshooting
 
@@ -271,6 +297,11 @@ outputs.
 
 **A slider moves but the screen does not change.** Something else already owns
 gamma control for that output — almost always `hyprsunset`. `pkill hyprsunset`.
+
+**A screen is stuck dark or warm and the plugin is gone.** The daemon is still
+applying the last ramp it was given. `pkill wl-gammarelay-rs`, or log out — it
+dies with the session. If the plugin is still installed, `omarchy-nightlight
+reset` is the tidy way.
 
 **A screen is missing from the panel.** The list comes from
 `busctl --user tree rs.wl-gammarelay`, which only shows outputs the daemon has

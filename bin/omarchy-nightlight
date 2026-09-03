@@ -18,6 +18,7 @@
 #   omarchy-nightlight DP-2 off        only DP-2 neutral
 #   omarchy-nightlight on              restore the saved percentages
 #   omarchy-nightlight toggle          off if anything is on, else on
+#   omarchy-nightlight reset           neutral white and full brightness, everywhere
 #   omarchy-nightlight restore         re-apply the saved file (use at login)
 #   omarchy-nightlight --json          machine-readable state, for the bar widget
 #
@@ -36,7 +37,20 @@ set -uo pipefail
 # release, so exactly one write lands per gesture.
 NO_SAVE=0
 
+# Set by --no-start. Installing a plugin must not change the machine: the bar
+# widget polls with this flag so merely enabling it never brings the daemon up
+# and never takes the Wayland gamma control away from whatever already holds it
+# -- hyprsunset, most likely. The daemon starts the first time the user actually
+# asks for something.
+NO_START=0
+
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/nightlight.conf"
+
+# The write lock lives in the runtime directory, not beside the config: it is
+# session state, it is cleaned up at logout on its own, and it keeps an empty
+# lock file out of the user's config folder where it would look like ours to
+# keep and theirs to wonder about.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-nightlight.lock"
 SERVICE="rs.wl-gammarelay"
 IFACE="rs.wl.gammarelay"
 NEUTRAL=6500       # 0% on the Windows scale
@@ -48,6 +62,12 @@ DEFAULT=40         # used when an output has nothing saved yet
 ON_BELOW=6000
 
 die() { printf 'omarchy-nightlight: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'omarchy-nightlight: %s\n' "$*" >&2; }
+
+# Set whenever a write did not land. The command still prints what it can, but
+# it must not claim success: a script that trusts the exit code has to be able
+# to tell "applied" from "the daemon ignored me".
+FAILED=0
 
 # The scale is linear in Kelvin, deliberately. The eye perceives colour
 # temperature closer to linearly in mireds (a million over Kelvin), so the warm
@@ -72,9 +92,15 @@ to_human() { echo "${1//_/-}"; }
 # someone running the command with it closed.
 ensure_daemon() {
   busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
+  (( NO_START )) && return 1
 
-  command -v wl-gammarelay-rs >/dev/null 2>&1 || die \
-    "wl-gammarelay-rs is not installed. Install it with: yay -S wl-gammarelay-rs"
+  command -v wl-gammarelay-rs >/dev/null 2>&1 || return 1
+
+  # A daemon that is already running but has not claimed the bus name is not
+  # going to be helped by starting another one -- it is being blocked, almost
+  # always by hyprsunset holding the outputs. Launching a second copy every time
+  # anyone runs this command would pile up processes for the whole session.
+  pgrep -x wl-gammarelay-rs >/dev/null 2>&1 && return 1
 
   # Prefer uwsm-app so the daemon lands in the compositor's own systemd scope
   # and dies with the session; fall back to a bare setsid where uwsm is absent.
@@ -84,21 +110,37 @@ ensure_daemon() {
     setsid wl-gammarelay-rs >/dev/null 2>&1 &
   fi
 
-  for _ in {1..25}; do
-    sleep 0.2
+  # Backoff rather than 25 flat polls: a daemon that is going to come up does so
+  # in well under a second, and one that is not should not cost three more
+  # seconds of a blocked terminal on every single call.
+  local wait=0.1
+  for _ in {1..6}; do
+    sleep "$wait"
     busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
+    wait=$(awk "BEGIN{print $wait * 1.8}")
   done
+  return 1
+}
 
-  if pgrep -x hyprsunset >/dev/null 2>&1; then
-    die "wl-gammarelay-rs would not start, and hyprsunset is running. They both
-claim the Wayland gamma-control protocol and only one client per output is
-allowed. Stop hyprsunset first: pkill hyprsunset"
+# One line, no quotes and no newlines: it goes into the JSON the widget reads.
+daemon_problem() {
+  if ! command -v wl-gammarelay-rs >/dev/null 2>&1; then
+    printf 'wl-gammarelay-rs is not installed. Install it with: yay -S wl-gammarelay-rs'
+  elif pgrep -x hyprsunset >/dev/null 2>&1; then
+    printf 'hyprsunset is holding the Wayland gamma control, so wl-gammarelay-rs cannot start. Stop it: pkill hyprsunset'
+  elif pgrep -x wl-gammarelay-rs >/dev/null 2>&1; then
+    printf 'wl-gammarelay-rs is running but has not claimed its bus name. Something else may hold the gamma control.'
+  elif (( NO_START )); then
+    printf 'wl-gammarelay-rs is not running.'
+  else
+    printf 'wl-gammarelay-rs would not start.'
   fi
-  die "wl-gammarelay-rs would not start"
 }
 
 # The outputs that exist right now, in human names (DP-2, HDMI-A-1...).
-outputs() {
+# Resolved once per run into ALL_OUTPUTS below: this used to re-shell busctl on
+# every call, which on a slider drag meant hundreds of forks a second.
+outputs_uncached() {
   busctl --user tree "$SERVICE" 2>/dev/null |
     grep -oE '/outputs/[A-Za-z0-9_]+' | sed 's|/outputs/||' | while read -r o; do
       to_human "$o"
@@ -132,6 +174,8 @@ set_brightness() {
   local pct=$1
   (( pct < BRIGHT_MIN )) && pct=$BRIGHT_MIN
   (( pct > 100 )) && pct=100
+  # Returns busctl's own status, so every caller can tell a delivered write
+  # from a refused one.
   set_prop "$2" Brightness d "$(printf '%d.%02d' $((pct / 100)) $((pct % 100)))"
 }
 
@@ -179,11 +223,23 @@ saved_pct() {
 save_pct() { save_key "$1" "$2"; }
 save_brightness_pct() { save_key "$1.brightness" "$2"; }
 
+# Serialised with flock because the write is read-modify-write, and the two
+# writers here are genuinely concurrent: a `+5` keybinding can fire while a
+# slider is being released. Without the lock both read the old file and the
+# loser's key vanishes from it. The mv below is already atomic; this is what
+# makes the read-then-write around it atomic too.
 save_key() {
   local out=$1 pct=$2
   mkdir -p "$(dirname "$CONF")"
+  ( flock 9 || exit 1
+    save_key_locked "$out" "$pct"
+  ) 9>"$LOCK"
+}
+
+save_key_locked() {
+  local out=$1 pct=$2
   if [[ ! -f $CONF ]]; then
-    cat > "$CONF" <<EOF
+    cat > "$CONF" <<EOF || return 1
 # Night light: per-output intensity, in percent.
 #
 # Same scale as the Windows slider: 0 = neutral, 100 = maximum.
@@ -195,18 +251,34 @@ save_key() {
 # The output name is the same one \`hyprctl monitors\` prints.
 EOF
   fi
-  # Write a whole new file and rename it over the old one. `sed -i` and `>>`
-  # both edit in place, so a crash or a full disk mid-write leaves a truncated
-  # file -- and this one file holds every screen's setting, so a bad moment
-  # would cost the lot. rename(2) is atomic: a reader sees the old file or the
-  # new one, never half of either.
+
+  # Write a whole new file and rename it over the old one. rename(2) is atomic:
+  # a reader sees the old file or the new one, never half of either.
+  #
+  # But atomically promoting a BAD file is just a reliable way to lose data, and
+  # that is what used to happen. None of the commands building the temp file had
+  # their exit status checked, so an unreadable config (mode 000, or a full
+  # disk) produced a one-line temp that `mv` then promoted over the real thing --
+  # exit 0, "success" printed, every other screen's setting gone. `mv` only
+  # needs write permission on the directory, so it had no trouble doing it.
   local tmp="$CONF.tmp.$$"
-  if grep -qE "^\s*$out\s*=" "$CONF"; then
-    sed -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF" >"$tmp"
+  if grep -qE "^\s*$out\s*=" "$CONF" 2>/dev/null; then
+    sed -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   else
-    { cat "$CONF"; printf '%s=%s\n' "$out" "$pct"; } >"$tmp"
+    { cat "$CONF" && printf '%s=%s\n' "$out" "$pct"; } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   fi
-  mv -f "$tmp" "$CONF"
+
+  # A temp file smaller than the original means content was lost on the way,
+  # whatever the exit codes said. Refuse rather than promote it.
+  local old_size new_size
+  old_size=$(wc -c <"$CONF" 2>/dev/null) || { rm -f "$tmp"; return 1; }
+  new_size=$(wc -c <"$tmp" 2>/dev/null) || { rm -f "$tmp"; return 1; }
+  if (( new_size < old_size - 8 )); then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv -f "$tmp" "$CONF" || { rm -f "$tmp"; return 1; }
 }
 
 # ---------------------------------------------------------------------------
@@ -222,7 +294,11 @@ light_up() {
   local out=$1 pct=$2
   (( pct < 0 )) && pct=0
   (( pct > 100 )) && pct=100
-  set_kelvin "$out" "$(pct_to_kelvin "$pct")"
+  set_kelvin "$out" "$(pct_to_kelvin "$pct")" || {
+    warn "could not set the temperature on $out"
+    FAILED=1
+    return 1
+  }
 }
 
 # The percentage a momentary "on" should use for one output. A screen saved at 0
@@ -240,20 +316,46 @@ on_pct() {
 # `DP-2 40`, a `+5`. That is the one gesture that means "this is the intensity I
 # want for this screen", so it is the one gesture allowed to rewrite the file.
 apply_to() {
-  local out=$1 pct=$2
+  local out=$1 pct=$2 k actual
   (( pct < 0 )) && pct=0
   (( pct > 100 )) && pct=100
-  set_kelvin "$out" "$(pct_to_kelvin "$pct")"
+  k=$(pct_to_kelvin "$pct")
+
+  set_kelvin "$out" "$k" || {
+    warn "could not set the temperature on $out"
+    FAILED=1
+    return 1
+  }
+
   (( NO_SAVE )) && return 0
+
+  # Read it back before recording it. busctl exits 0 for a call that was
+  # delivered, which is not the same as a call that took effect -- a monitor
+  # unplugged between listing and writing takes the write and drops it. Without
+  # this the command printed the old value, saved the new one, and changed
+  # nothing on screen, all with exit 0. Only on a committing write: a drag
+  # passes --no-save and skips the extra round trip.
+  actual=$(kelvin_of "$out")
+  if [[ -n $actual && $actual != "$k" ]]; then
+    warn "$out did not take the new temperature; leaving the saved value alone"
+    FAILED=1
+    return 1
+  fi
+
   # Zero is saved too: "this screen stays neutral" is a choice, and it has to
   # survive `on` and the next boot. That is the whole point of per-output
-  # control — a portrait monitor used for dark-mode terminals is usually worse
+  # control -- a portrait monitor used for dark-mode terminals is usually worse
   # with a warm filter on it.
   #
-  # What does NOT save is `off`, which writes straight to DBus: that is a
-  # temporary blackout, and the chosen intensity must stay on file so `on` can
-  # bring it back.
-  save_pct "$out" "$pct"
+  # Nothing else in this script writes the file. `off`, `on` and `toggle` all go
+  # through set_kelvin or light_up, so a momentary gesture can never erase a
+  # screen's saved intensity -- or, worse, promote an excused screen to a real
+  # percentage and light it up at the next login.
+  save_pct "$out" "$pct" || {
+    warn "could not write $CONF; $out is set but the change will not survive a reboot"
+    FAILED=1
+    return 1
+  }
 }
 
 # Software brightness, applied through the same gamma ramp as the temperature.
@@ -265,21 +367,50 @@ apply_brightness() {
   local out=$1 pct=$2
   (( pct < BRIGHT_MIN )) && pct=$BRIGHT_MIN
   (( pct > 100 )) && pct=100
-  set_brightness "$pct" "$out"
+  set_brightness "$pct" "$out" || {
+    warn "could not set the brightness on $out"
+    FAILED=1
+    return 1
+  }
   (( NO_SAVE )) && return 0
-  save_brightness_pct "$out" "$pct"
+  save_brightness_pct "$out" "$pct" || {
+    warn "could not write $CONF; $out is set but the change will not survive a reboot"
+    FAILED=1
+    return 1
+  }
 }
 
-# Turn "+5", "-5" or "40" into a final percentage for one output.
+# Turn "+5", "-5" or "40" into a final percentage for one output, already
+# clamped to 0-100.
+#
+# Two things this has to get right, both of which used to be wrong:
+#
+# The base for a relative step is where the screen WOULD be, not what it is
+# showing. After `off` the screen reads 6500K, so stepping from the live value
+# meant `off` then `+5` recorded 5 -- destroying the intensity the file was
+# holding for you, which is the one promise `off` makes.
+#
+# And the clamp belongs here, before anything is saved. It used to happen inside
+# apply_to, which then wrote the clamped number: a global `-5` that ran past
+# zero recorded 0, and 0 is exactly the mark that means "excuse this screen from
+# the filter forever". Eight taps of a keybinding could retire a monitor
+# silently, and nothing but an explicit percentage brought it back.
 resolve_pct() {
-  local out=$1 want=$2 now
+  local out=$1 want=$2 now result
   case $want in
     +*|-*)
-      now=$(kelvin_of "$out")
-      now=$([[ -n $now ]] && kelvin_to_pct "$now" || echo 0)
-      echo $(( now + want )) ;;
-    *) echo "$want" ;;
+      if is_on "$out"; then
+        now=$(kelvin_of "$out")
+        now=$([[ -n $now ]] && kelvin_to_pct "$now" || echo 0)
+      else
+        now=$(saved_pct "$out")
+      fi
+      result=$(( now + want )) ;;
+    *) result=$want ;;
   esac
+  (( result < 0 )) && result=0
+  (( result > 100 )) && result=100
+  echo "$result"
 }
 
 # hyprsunset and wl-gammarelay-rs both claim the Wayland gamma-control protocol,
@@ -317,17 +448,22 @@ show() {
 
 # The contract the bar widget reads. Keep the key names stable.
 json() {
-  local o k b pct on first=1
-  printf '{"warning":"%s","outputs":[' "$(conflict_warning)"
+  local o k b pct on configured first=1
+  printf '{"warning":"%s","daemon":true,"outputs":[' "$(conflict_warning)"
   for o in $(outputs); do
+    # One read of the temperature, reused for both the value and the on/off
+    # decision. Calling is_on here meant a second busctl round trip per screen.
     k=$(kelvin_of "$o"); [[ -z $k ]] && continue
-    if is_on "$o"; then on=true; pct=$(kelvin_to_pct "$k")
+    if (( k < ON_BELOW )); then on=true; pct=$(kelvin_to_pct "$k")
     else on=false; pct=0; fi
     (( first )) || printf ','
     first=0
     b=$(brightness_of "$o") || b=100
-    printf '{"name":"%s","percent":%d,"kelvin":%d,"on":%s,"saved":%d,"brightness":%d}' \
-      "$o" "$pct" "$k" "$on" "$(saved_pct "$o")" "$b"
+    # `configured` separates "never chosen" from "chosen as 40", which `saved`
+    # alone cannot express because it falls back to the default.
+    if pct_in_file "$o" >/dev/null; then configured=true; else configured=false; fi
+    printf '{"name":"%s","percent":%d,"kelvin":%d,"on":%s,"saved":%d,"configured":%s,"brightness":%d}' \
+      "$o" "$pct" "$k" "$on" "$(saved_pct "$o")" "$configured" "$b"
   done
   printf ']}\n'
 }
@@ -335,15 +471,39 @@ json() {
 # ---------------------------------------------------------------------------
 ARGS=()
 for arg in "$@"; do
-  if [[ $arg == --no-save ]]; then NO_SAVE=1; else ARGS+=("$arg"); fi
+  case $arg in
+    --no-save)  NO_SAVE=1 ;;
+    --no-start) NO_START=1 ;;
+    *)          ARGS+=("$arg") ;;
+  esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
 case "${1:-}" in
-  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  # Print the header comment and stop at the first line that is not one, rather
+  # than a hardcoded range that leaked `set -uo pipefail` and half of the next
+  # comment every time the header changed length.
+  -h|--help|help) sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-ensure_daemon
+# A read must never be the thing that starts the daemon, and a machine without
+# it must still get an answer it can act on rather than a failure.
+if ! ensure_daemon; then
+  case "${1:-}" in
+    --json)
+      printf '{"warning":"%s","daemon":false,"outputs":[]}\n' "$(daemon_problem)"
+      exit 0 ;;
+    "")
+      printf '%s\n' "$(daemon_problem)"
+      exit 0 ;;
+    *)
+      die "$(daemon_problem)" ;;
+  esac
+fi
+
+# Listed once, then served from memory for the rest of the run.
+mapfile -t ALL_OUTPUTS < <(outputs_uncached)
+outputs() { (( ${#ALL_OUTPUTS[@]} )) && printf '%s\n' "${ALL_OUTPUTS[@]}"; return 0; }
 
 # If the first argument names an output, the command applies to it alone.
 TARGETS=(); ACTION=""; NAMED_OUTPUT=0
@@ -351,7 +511,9 @@ TARGETS=(); ACTION=""; NAMED_OUTPUT=0
 # 80`). It has to be read here because naming an output shifts every position
 # by one, and reading $2 from inside a case branch would silently be the action
 # itself for `DP-2 brightness 80`.
-if [[ -n ${1:-} ]] && outputs | grep -qx -- "$1"; then
+# -F because an output name is data, not a pattern: without it an argument of
+# `.*` would match some real output and quietly act on the wrong screen.
+if [[ -n ${1:-} ]] && outputs | grep -qxF -- "$1"; then
   TARGETS=("$1"); ACTION="${2:-}"; ARG="${3:-}"; NAMED_OUTPUT=1
 else
   mapfile -t TARGETS < <(outputs)
@@ -368,7 +530,21 @@ excused() {
   (( p == 0 ))
 }
 
-(( ${#TARGETS[@]} )) || die "no outputs found"
+# No outputs is the shape the conflict takes: the daemon answers on the bus but
+# has bound nothing, because another client holds every output's gamma control.
+# Saying only "no outputs found" here is what made that case unexplainable.
+if (( ${#TARGETS[@]} == 0 )); then
+  conflict=$(conflict_warning)
+  reason="no outputs found. ${conflict:-wl-gammarelay-rs has not bound any output; something else may hold the gamma control.}"
+  # A caller asking for JSON gets JSON, including when the answer is "none".
+  # Printing prose on this path made the widget fall back to "unusable" and keep
+  # stale values, instead of saying there were no screens.
+  if [[ ${ACTION:-} == --json ]]; then
+    printf '{"warning":"%s","daemon":true,"outputs":[]}\n' "$reason"
+    exit 0
+  fi
+  die "$reason"
+fi
 
 case "$ACTION" in
   "")
@@ -392,12 +568,22 @@ case "$ACTION" in
     for o in "${TARGETS[@]}"; do
       b=$(brightness_in_file "$o") && set_brightness "$b" "$o"
       p=$(pct_in_file "$o") || continue
-      (( p > 0 )) && set_kelvin "$o" "$(pct_to_kelvin "$p")"
+      # A screen written as 0 is meant to be neutral, so say so rather than
+      # leaving whatever ramp happened to be loaded. At login that is already
+      # true and this is a no-op; run by hand after an `on` it is the difference
+      # between "restored the file" and "restored most of the file".
+      if (( p > 0 )); then set_kelvin "$o" "$(pct_to_kelvin "$p")"
+      else set_kelvin "$o" "$NEUTRAL"; fi
     done ;;
 
   on)
-    for o in "${TARGETS[@]}"; do excused "$o" && continue; light_up "$o" "$(on_pct "$o")"; done
-    osd "$(on_pct "${TARGETS[0]}")" "Night light"
+    osd_pct=""
+    for o in "${TARGETS[@]}"; do
+      excused "$o" && continue
+      [[ -z $osd_pct ]] && osd_pct=$(on_pct "$o")
+      light_up "$o" "$(on_pct "$o")"
+    done
+    osd "${osd_pct:-0}" "Night light"
     show ;;
 
   off)
@@ -414,9 +600,27 @@ case "$ACTION" in
       for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
       osd 0 "Night light off"
     else
-      for o in "${TARGETS[@]}"; do excused "$o" && continue; light_up "$o" "$(on_pct "$o")"; done
-      osd "$(on_pct "${TARGETS[0]}")" "Night light"
+      osd_pct=""
+      for o in "${TARGETS[@]}"; do
+        excused "$o" && continue
+        [[ -z $osd_pct ]] && osd_pct=$(on_pct "$o")
+        light_up "$o" "$(on_pct "$o")"
+      done
+      osd "${osd_pct:-0}" "Night light"
     fi
+    show ;;
+
+  reset)
+    # Everything back to how the screen looks with no plugin at all: neutral
+    # white and full brightness. This is the way out, and it matters most for
+    # someone who dimmed a screen and then removed the plugin -- the CLI goes
+    # with the folder, and the daemon keeps applying the last ramp it was given.
+    # Nothing is saved, so the chosen intensities survive for a later `on`.
+    for o in "${TARGETS[@]}"; do
+      set_kelvin "$o" "$NEUTRAL"
+      set_brightness 100 "$o"
+    done
+    osd 0 "Night light reset"
     show ;;
 
   brightness)
@@ -425,14 +629,38 @@ case "$ACTION" in
     # never skipped for an "excused" screen: being excused is a statement about
     # colour temperature, not about how bright you want the panel.
     [[ $ARG =~ ^[0-9]+$ ]] || die "brightness takes a percentage from $BRIGHT_MIN to 100"
+    # Say no rather than silently clamping: the message promised a range, and a
+    # `brightness 0` that quietly became 10 taught the caller the wrong thing.
+    (( ARG >= BRIGHT_MIN && ARG <= 100 )) || die "brightness takes a percentage from $BRIGHT_MIN to 100, got $ARG"
     for o in "${TARGETS[@]}"; do apply_brightness "$o" "$ARG"; done
     show ;;
 
   +[0-9]*|-[0-9]*|[0-9]*)
     [[ $ACTION =~ ^[+-]?[0-9]+$ ]] || die "invalid percentage: $ACTION"
-    for o in "${TARGETS[@]}"; do excused "$o" && continue; apply_to "$o" "$(resolve_pct "$o" "$ACTION")"; done
-    osd "$(resolve_pct "${TARGETS[0]}" "$ACTION")" "Night light"
+    relative=0
+    [[ $ACTION == [+-]* ]] && relative=1
+    osd_pct=""
+    for o in "${TARGETS[@]}"; do
+      excused "$o" && continue
+      target=$(resolve_pct "$o" "$ACTION")
+      [[ -z $osd_pct ]] && osd_pct=$target
+      if (( relative && target == 0 )); then
+        # A decrement that runs out of room means "off", not "retire this
+        # screen". Apply neutral and leave the saved intensity where it is, so
+        # the next `on` or `+5` still knows what you had chosen.
+        set_kelvin "$o" "$NEUTRAL" || { warn "could not reach $o"; FAILED=1; }
+      else
+        apply_to "$o" "$target"
+      fi
+    done
+    # The OSD shows the first screen the command actually touched. Reading
+    # TARGETS[0] blindly reported a number for a screen that had been skipped.
+    osd "${osd_pct:-0}" "Night light"
     show ;;
 
   *) die "unknown command \"$ACTION\". See 'omarchy-nightlight --help'" ;;
 esac
+
+# A command that printed a result but failed to apply or record part of it must
+# not look like a success to whatever called it.
+exit "$FAILED"

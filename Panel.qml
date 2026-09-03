@@ -30,16 +30,16 @@ Panel {
   moduleName: "vitorcanoas.nightlight"
   // A bar surface exists per monitor, so this widget is live once per screen
   // even though it appears once in the layout, and an IPC target routes to
-  // exactly one handler. `manageIpc: false` is meant to stand the base class's
-  // handler down so ours can own the target -- but on Quickshell 0.3.1 a
-  // disabled IpcHandler still registers, and the base one won the race and
-  // shadowed ours: the target resolved, and every method on it answered
-  // "Function not found".
+  // exactly one handler. `manageIpc: false` stands the base class's handler
+  // down so the one below owns the target; the base declares its handler
+  // `enabled: manageIpc && ipcTarget !== ""`, so either half alone would do it.
   //
-  // Leaving `ipcTarget` empty is what actually settles it. The base handler has
-  // no target left to claim, our own IpcHandler below owns the name outright,
-  // and nothing else on Panel depends on the property.
+  // The remaining "registered but will not be used" warning is the sibling
+  // instances losing the race for the same target, which is exactly what
+  // omarchy.monitor and omarchy.tailscale do too. Whichever wins relays to the
+  // others through peers().
   manageIpc: false
+  ipcTarget: "vitorcanoas.nightlight"
 
   // The CLI lives in this plugin's own directory, so the plugin works straight
   // after `omarchy plugin add` with nothing on PATH. install.sh only adds a
@@ -81,9 +81,6 @@ Panel {
   // Which slider the pending debounce belongs to, so one timer serves both.
   property bool debouncedBrightness: false
 
-  // A command queued while another is in flight (last one wins).
-  property var queued: null
-
   // Carries sub-notch wheel deltas between events; same trick the first-party
   // audio widget uses so a touchpad scroll is not swallowed.
   property real wheelAccumulator: 0
@@ -123,6 +120,8 @@ Panel {
   // stays visible instead of hiding behind an average.
   readonly property bool anyOn: screensOn > 0
   readonly property string summary: Model.summary(stateLoaded, screenCount, screensOn)
+  // True only when we have actually heard back and there is nothing to show.
+  readonly property bool noScreens: stateLoaded && screenCount === 0
 
   // ---- the sibling instances ----------------------------------------------
   // Every screen gets its own copy of this widget. They must agree on state,
@@ -161,17 +160,22 @@ Panel {
   }
 
   function adoptState(names, byName, warning) {
-    // The output list always applies (a monitor plugged or unplugged), but it is
-    // only reassigned when it really changed, so the delegates stay put.
+    // Nothing is adopted mid-gesture, the output list least of all. The
+    // Repeater's model is a JS array, so reassigning it rebuilds every delegate
+    // -- including the slider under the user's finger. A destroyed slider never
+    // emits onDraggingChanged, so `draggingName` would stay set forever, `busy`
+    // with it, and this function would early-return for the rest of the shell's
+    // life. The CLI could set that off by itself: a busctl hiccup used to drop
+    // an output for a single poll and flip the signature.
+    if (root.busy) return
+
+    // The output list applies whenever it really changed -- a monitor plugged
+    // or unplugged -- and only then, so the delegates stay put otherwise.
     if (Model.signature(names) !== Model.signature(root.names)) {
       root.names = names
       root.cursorIndex = Math.min(root.cursorIndex, Math.max(0, names.length * 3))
     }
 
-    // Values, by contrast, only land when this instance is not mid-gesture —
-    // otherwise a poll would yank the slider out of the user's hand. Only the
-    // instance being dragged is busy; its siblings still take the update.
-    if (root.busy) return
     root.byName = byName
     root.pending = ({})
     root.stateLoaded = true
@@ -179,9 +183,14 @@ Panel {
     root.warningText = String(warning || "")
   }
 
+
   function adoptError(message) {
     root.stateLoaded = false
     root.errorText = message
+    // Drop the optimistic values with it. They describe what the user asked
+    // for, and the request is what just failed -- keeping them would leave the
+    // panel showing a state no screen is in.
+    root.pending = ({})
   }
 
   // ---- reading ------------------------------------------------------------
@@ -209,6 +218,15 @@ Panel {
   // so anything registered outside this folder would outlive `omarchy plugin
   // remove` forever. omarchy-shell is always running, so a Timer here starts and
   // dies with the plugin and leaves nothing behind.
+  // Closing the drawer removes the brightness stops from the cursor's reach, so
+  // a cursor parked on one has to be moved off it -- the house pattern is to
+  // reclamp on every visibility change.
+  function toggleDrawer() {
+    root.showMore = !root.showMore
+    if (!root.showMore && root.cursorIndex > 0 && (root.cursorIndex - 1) % 3 === 2)
+      root.cursorIndex -= 1
+  }
+
   // The advanced drawer starts closed on every open, so the panel someone sees
   // when they click the bar icon never grows.
   property bool showMore: false
@@ -223,15 +241,36 @@ Panel {
     return mins <= 1 ? "paused, 1 min left" : "paused, " + mins + " min left"
   }
 
+  // Persisted, not just held in memory. `off` deliberately writes nothing to the
+  // CLI's config, so if every instance is destroyed mid-pause -- a theme switch,
+  // a config edit, any plugin add or remove reloads the shell -- nothing is left
+  // anywhere that knows to turn the filter back on. The screens sit neutral with
+  // their intensities still on disk, which reads as "the plugin broke".
   function startPause(minutes) {
-    root.publishPause(Date.now() + Math.max(1, minutes) * 60000)
+    var until = Date.now() + Math.max(1, minutes) * 60000
+    root.publishPause(until)
+    persist({ pausedUntil: until })
     run(["off"])
   }
 
   function endPause() {
     if (!root.paused) return
     root.publishPause(0)
+    persist({ pausedUntil: 0 })
     run(["on"])
+  }
+
+  // Called once at startup. A pause that expired while the shell was down ends
+  // immediately; one still running is picked back up with its remaining time.
+  function resumePauseFromSettings() {
+    var stored = Number(setting("pausedUntil", 0)) || 0
+    if (stored <= 0) return
+    if (Date.now() >= stored) {
+      persist({ pausedUntil: 0 })
+      run(["on"])
+      return
+    }
+    root.publishPause(stored)
   }
 
   function publishPause(until) {
@@ -240,6 +279,22 @@ Panel {
       var peer = items[i]
       if (peer && typeof peer.adoptPause === "function") peer.adoptPause(until)
     }
+  }
+
+  function publishPhase(phase) {
+    var items = peers()
+    for (var i = 0; i < items.length; i++) {
+      var peer = items[i]
+      if (peer && typeof peer.adoptPhase === "function") peer.adoptPhase(phase)
+    }
+  }
+
+  // Only the owner advances the phase, so unplugging the owner's monitor used to
+  // hand a fresh instance an empty phase -- which then re-applied the current
+  // one on its next tick and quietly undid a manual change made between
+  // boundaries. Publishing it keeps every instance able to take over.
+  function adoptPhase(phase) {
+    root.schedulePhase = phase
   }
 
   function adoptPause(until) {
@@ -266,6 +321,10 @@ Panel {
   // a manual override between boundaries is left alone until the next one.
   property string schedulePhase: ""
 
+  // Bumped to force the schedule's text fields to re-read the stored value
+  // after a rejected edit.
+  property int scheduleFieldsRevision: 0
+
   // Settings go inline on this widget's shell.json entry, which is Omarchy's
   // rule for plugin settings -- no private settings file.
   //
@@ -277,26 +336,37 @@ Panel {
   // from inside the evaluation that config triggered, is a binding loop, and Qt
   // drops such a write silently rather than telling you.
   function persist(values) {
-    if (!bar || !bar.shell || typeof bar.shell.updateEntryInline !== "function") return
     var entry = { id: root.moduleName }
     for (var key in settings) if (key !== "id") entry[key] = settings[key]
     for (var name in values) entry[name] = values[name]
+    // Update the in-memory copy first and unconditionally. The disk write can be
+    // unavailable -- no shell handed down, an older host -- and when it is, the
+    // running session should still agree with itself rather than silently
+    // keeping the old value.
     root.settings = entry
+    if (!bar || !bar.shell || typeof bar.shell.updateEntryInline !== "function") return
     Qt.callLater(function() {
       if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, entry)
     })
   }
 
   function setScheduleEnabled(value) {
-    persist({ scheduleEnabled: value === true })
     root.schedulePhase = ""
-    // Apply straight away rather than waiting up to 30s: switching a schedule on
-    // and watching nothing happen reads as broken.
-    if (value === true) Qt.callLater(function() { root.applySchedule(true) })
+    persist({ scheduleEnabled: value === true })
+    // No explicit apply here. The schedule timer has triggeredOnStart, so
+    // `scheduleEnabled` turning true starts it and fires immediately -- and
+    // with the phase just cleared that first tick is not a no-op. Calling
+    // applySchedule as well ran the CLI twice and showed two OSDs per click.
   }
 
   function setScheduleTime(key, value) {
-    if (Model.parseTime(value) < 0) return // leave the stored time alone
+    if (Model.parseTime(value) < 0) {
+      // Put the field back to the stored value. Returning quietly left `9:5`
+      // sitting in a box whose binding had already been broken by typing, so
+      // the panel showed a time the schedule was not using.
+      root.scheduleFieldsRevision++
+      return
+    }
     var next = {}
     next[key] = Model.formatTime(Model.parseTime(value))
     persist(next)
@@ -309,7 +379,7 @@ Panel {
     var phase = Model.phaseAt(new Date(), root.scheduleOnAt, root.scheduleOffAt)
     if (phase === "") return
     if (!force && phase === root.schedulePhase) return
-    root.schedulePhase = phase
+    root.publishPhase(phase)
     if (phase === "night") run([root.scheduleNightPercent > 0 ? String(root.scheduleNightPercent) : "on"])
     else run(["off"])
   }
@@ -319,14 +389,49 @@ Panel {
   // so the UI keeps painting while bash runs. A command arriving while another
   // is in flight becomes `queued` and fires from onExited — that is what stops
   // a long drag from piling up processes.
+  // One queue slot per output. A single global slot was right for repeated
+  // writes to the same slider and wrong across screens: with applyProc busy,
+  // touching HDMI-A-1's switch and then DP-2's dropped the first command
+  // entirely -- while setPending had already moved its knob, so the panel
+  // showed one thing and the screen did another until the next good poll.
+  // Keyed by output, last-write-wins per output, which is what a slider needs
+  // and what a second screen must not be caught by.
+  property var queuedByOutput: ({})
+
+  // Commands with no output of their own (`on`, `off`, the wheel's `+5`) share
+  // one slot under this key: they are whole-machine gestures, so a newer one
+  // genuinely does supersede an older one.
+  readonly property string globalQueueKey: "\u0000global"
+
+  function queueKeyFor(args) {
+    if (args.length > 1 && root.byName[args[0]] !== undefined) return args[0]
+    return root.globalQueueKey
+  }
+
   function run(args) {
     if (applyProc.running) {
-      root.queued = args
+      var next = {}
+      for (var key in root.queuedByOutput) next[key] = root.queuedByOutput[key]
+      next[queueKeyFor(args)] = args
+      root.queuedByOutput = next
       return
     }
-    root.queued = null
+    root.queuedByOutput = ({})
     applyProc.command = [root.command].concat(args)
     applyProc.running = true
+  }
+
+  // Pull one queued command, oldest key first. The rest stay queued and go out
+  // as each process finishes.
+  function dequeue() {
+    for (var key in root.queuedByOutput) {
+      var args = root.queuedByOutput[key]
+      var rest = {}
+      for (var other in root.queuedByOutput) if (other !== key) rest[other] = root.queuedByOutput[other]
+      root.queuedByOutput = rest
+      return args
+    }
+    return null
   }
 
   function setPending(name, percent, on) {
@@ -516,6 +621,19 @@ Panel {
 
   // Keeps the cursor row inside the scroll area when there are many screens.
   // Rows have a uniform height, so a proportional scroll is enough here.
+  // Registered by each cursor-addressable row so scrolling can map the real
+  // item instead of guessing. The proportional version assumed uniform rows,
+  // which stopped being true the moment the drawer added a second slider and
+  // its own section to the column.
+  property var cursorItems: ({})
+
+  function registerCursorItem(index, item) {
+    var next = {}
+    for (var key in root.cursorItems) next[key] = root.cursorItems[key]
+    next[index] = item
+    root.cursorItems = next
+  }
+
   function keepCursorVisible() {
     if (!scrollArea) return
     var flick = scrollArea.contentItem
@@ -526,13 +644,41 @@ Panel {
       flick.contentY = 0
       return
     }
-    flick.contentY = Math.max(0, Math.min(maxY, maxY * (root.cursorIndex / Math.max(1, root.cursorMax))))
+
+    var item = root.cursorItems[root.cursorIndex]
+    if (!item || item.height === undefined) return
+    var margin = 6
+    var point = item.mapToItem(flick.contentItem || flick, 0, 0)
+    var top = point.y
+    var bottom = top + (item.height || 0)
+    if (top < flick.contentY + margin)
+      flick.contentY = Math.max(0, Math.min(maxY, top - margin))
+    else if (bottom > flick.contentY + flick.height - margin)
+      flick.contentY = Math.max(0, Math.min(maxY, bottom + margin - flick.height))
   }
+
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: refresh()
+  // The host injects `bar`, `moduleName` and `settings` after this item is
+  // constructed, so Component.onCompleted runs too early to read any of them --
+  // a pause stored in the settings was never seen, and isPollOwner() had no bar
+  // to ask. Deferring past the current event-loop pass puts all three in place
+  // first, and Qt.callLater collapses the three triggers into one run.
+  property bool started: false
+
+  function startOnce() {
+    if (root.started || !root.bar) return
+    root.started = true
+    if (root.isPollOwner()) root.refresh()
+    root.resumePauseFromSettings()
+  }
+
+  Component.onCompleted: Qt.callLater(startOnce)
+  onBarChanged: Qt.callLater(startOnce)
+  onSettingsChanged: Qt.callLater(startOnce)
+
 
   // Re-reading on open is not optional: the intensity may have changed from
   // outside (a keybinding, the Omarchy menu, a terminal call), and the panel
@@ -594,6 +740,28 @@ Panel {
     onTriggered: if (root.isPollOwner()) root.applySchedule(false)
   }
 
+  // A Process that never finishes stops the widget forever: refresh() guards on
+  // !stateProc.running and run() on applyProc.running, and nothing else ever
+  // clears either. It is reachable rather than theoretical -- the CLI blocks
+  // while it waits for the daemon, which is exactly the hyprsunset-conflict case
+  // the warning exists for. Same shape as the Tailscale service's pollWatchdog,
+  // for the same reason: a panel that silently stops refreshing stays stopped.
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    onTriggered: {
+      if (stateProc.running) stateProc.running = false
+      if (applyProc.running) {
+        applyProc.running = false
+        // Whatever was queued behind it is stale by now; drop it rather than
+        // firing a command the user asked for fifteen seconds ago.
+        root.queuedByOutput = ({})
+        root.pending = ({})
+      }
+    }
+  }
+
   Timer {
     id: debounce
     interval: 180
@@ -636,9 +804,8 @@ Panel {
       if (exitCode !== 0)
         root.publishError(Model.clampMessage(applyErr.text) || "omarchy-nightlight failed")
 
-      if (root.queued) {
-        var next = root.queued
-        root.queued = null
+      var next = root.dequeue()
+      if (next) {
         root.run(next)
         return
       }
@@ -651,7 +818,7 @@ Panel {
   // `refresh` and `state` are relayed so a scripted change reaches every screen
   // rather than only the one that answered.
   IpcHandler {
-    target: "vitorcanoas.nightlight"
+    target: root.ipcTarget
 
     function open(): void { root.open() }
     function close(): void { root.close() }
@@ -682,7 +849,10 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "󰔎"
-    dimmed: root.stateLoaded && !root.anyOn
+    // Dimmed when off AND when the state is unknown. Requiring stateLoaded meant
+    // a failed read left the glyph undimmed, which reads as "the filter is on"
+    // at exactly the moment nothing is known.
+    dimmed: !root.stateLoaded || !root.anyOn
     useActiveColor: false
     tooltipText: root.errorText !== "" ? root.errorText : ("Night light: " + root.summary)
 
@@ -763,7 +933,7 @@ Panel {
             readonly property bool moreOpen: root.showMore
             function focusHero() { root.placeCursor(0) }
             function flip() { root.toggleAll() }
-            function toggleMore() { root.showMore = !root.showMore }
+            function toggleMore() { root.toggleDrawer() }
 
             PanelHero {
               id: hero
@@ -874,7 +1044,19 @@ Panel {
             foreground: root.foreground
           }
 
+          Text {
+            textFormat: Text.PlainText
+            visible: root.noScreens
+            width: parent.width
+            text: "No screens available."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
           PanelSectionHeader {
+            visible: !root.noScreens
             text: root.screenCount === 1 ? "SCREEN" : "SCREENS"
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -981,16 +1163,28 @@ Panel {
                   // `draggingName` freezes the polls for as long as the gesture
                   // lasts.
                   onDraggingChanged: root.draggingName = dragging ? screenRow.name : ""
+                  // A delegate destroyed mid-drag never reaches onReleased, so
+                  // the lock has to be dropped here or it is held for the life
+                  // of the shell. Guarded by name so a rebuild cannot clear a
+                  // lock that belongs to another row.
+                  Component.onDestruction: if (root.draggingName === screenRow.name) root.draggingName = ""
 
                   onMoved: function(v) { root.previewPercent(screenRow.name, v) }
                   onReleased: function(v) {
-                    debounce.stop()
+                    // Only cancel the debounce if it is this slider's. It used
+                    // to stop unconditionally, so releasing one row's slider
+                    // discarded a write another row had pending -- the value
+                    // survived in `pending` but was never sent, and reverted on
+                    // the next poll.
+                    if (root.debouncedName === screenRow.name && !root.debouncedBrightness) debounce.stop()
                     root.applyPercent(screenRow.name, v)
                   }
                   // Right-click toggles this screen alone, the same way the
                   // first-party audio slider mutes the channel it belongs to.
                   onRightClicked: root.toggleScreen(screenRow.name)
                 }
+
+                Component.onCompleted: root.registerCursorItem(root.sliderIndex(screenRow.index), this)
 
                 HoverHandler {
                   onHoveredChanged: if (hovered) root.placeCursor(root.sliderIndex(screenRow.index))
@@ -1062,12 +1256,15 @@ Panel {
                       value: screenRow.brightness
 
                       onDraggingChanged: root.draggingName = dragging ? screenRow.name : ""
+                      Component.onDestruction: if (root.draggingName === screenRow.name) root.draggingName = ""
                       onMoved: function(v) { root.previewBrightness(screenRow.name, v) }
                       onReleased: function(v) {
-                        debounce.stop()
+                        if (root.debouncedName === screenRow.name && root.debouncedBrightness) debounce.stop()
                         root.applyBrightness(screenRow.name, v)
                       }
                     }
+
+                    Component.onCompleted: root.registerCursorItem(root.brightnessIndex(screenRow.index), this)
 
                     HoverHandler {
                       onHoveredChanged: if (hovered) root.placeCursor(root.brightnessIndex(screenRow.index))
@@ -1221,7 +1418,9 @@ Panel {
                 TextField {
                   id: onAtField
                   width: Style.space(70)
-                  text: root.scheduleOnAt
+                  // Reading the revision makes a rejected edit re-run this
+                  // binding and put the stored time back in the box.
+                  text: { root.scheduleFieldsRevision; return root.scheduleOnAt }
                   placeholderText: "20:00"
                   foreground: root.foreground
                   font.family: root.fontFamily
@@ -1249,7 +1448,9 @@ Panel {
                 TextField {
                   id: offAtField
                   width: Style.space(70)
-                  text: root.scheduleOffAt
+                  // Reading the revision makes a rejected edit re-run this
+                  // binding and put the stored time back in the box.
+                  text: { root.scheduleFieldsRevision; return root.scheduleOffAt }
                   placeholderText: "07:00"
                   foreground: root.foreground
                   font.family: root.fontFamily

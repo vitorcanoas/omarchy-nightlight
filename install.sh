@@ -44,7 +44,30 @@ MSG
 fi
 
 mkdir -p "$BIN_DIR"
-ln -sfn "$HERE/bin/omarchy-nightlight" "$LINK"
+
+# Refuse to overwrite anything that is not already our own symlink. The name is
+# generic enough to collide -- Omarchy itself ships `omarchy-toggle-nightlight`
+# -- and `ln -sfn` replaces a regular file without a word. Losing someone's own
+# script to an optional convenience step, with an uninstall that then `rm`s the
+# remains rather than restoring them, is not a trade this script gets to make.
+if [[ -e $LINK || -L $LINK ]]; then
+  if [[ -L $LINK && $(readlink -f "$LINK") == "$(readlink -f "$HERE/bin/omarchy-nightlight")" ]]; then
+    printf 'already linked: %s\n' "$LINK"
+    exit 0
+  fi
+  cat >&2 <<MSG
+$LINK already exists and is not this plugin's symlink.
+
+Refusing to replace it. Move it aside first, or link this plugin under another
+name if you would rather keep both:
+
+    ln -s "$HERE/bin/omarchy-nightlight" "$BIN_DIR/some-other-name"
+
+MSG
+  exit 1
+fi
+
+ln -s "$HERE/bin/omarchy-nightlight" "$LINK"
 printf 'linked %s -> %s\n' "$LINK" "$HERE/bin/omarchy-nightlight"
 printf 'remove it later with: rm -f %s\n' "$LINK"
 

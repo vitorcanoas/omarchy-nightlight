@@ -76,7 +76,12 @@ function parseState(raw) {
     }
   }
 
-  if (names.length === 0) return null
+  // An empty list is a real answer, not a parse failure: the CLI reports it
+  // with a warning explaining why (no daemon, or nothing bound because another
+  // client holds the gamma control). Returning null here made that case
+  // indistinguishable from unreadable output, so the panel kept stale values
+  // and said nothing.
+  if (names.length === 0 && !payload.warning) return null
   // `warning` is advisory, not an error: the CLI still worked. Today the only
   // one is hyprsunset holding the outputs, which makes every command appear to
   // do nothing at all -- the single most confusing way this can fail.

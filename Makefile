@@ -24,6 +24,13 @@ lint:
 # symlink because omarchy-plugin-validate refuses symlinks inside a plugin.
 dev:
 	@test -f manifest.json || { printf 'run make dev from the plugin repo root\n' >&2; exit 1; }
+	# rsync --delete on the wrong PLUGIN_DIR would empty it. $$HOME or a bare
+	# path is never a plugin directory, and the cost of being wrong here is
+	# someone's home directory.
+	@case "$(PLUGIN_DIR)" in \
+	  */omarchy/plugins/*) ;; \
+	  *) printf 'refusing to sync to %s: PLUGIN_DIR must be under omarchy/plugins/\n' "$(PLUGIN_DIR)" >&2; exit 1 ;; \
+	esac
 	@mkdir -p "$(PLUGIN_DIR)"
 	rsync -a --delete --exclude '.git/' --exclude '.lint/' ./ "$(PLUGIN_DIR)/"
 	omarchy-shell -q shell rescanPlugins
