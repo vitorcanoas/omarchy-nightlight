@@ -3,9 +3,10 @@
 Per-monitor night light for [Omarchy](https://omarchy.org): choose a different
 colour temperature and software brightness for every screen.
 
-Built for desks with more than one monitor: Omarchy's built-in night light
-applies one setting to every display. This plugin lets you warm one monitor
-while leaving another neutral.
+Built for desks with more than one monitor and long sessions: Omarchy's
+built-in night light applies one setting to every display. This plugin lets
+you choose a comfortable colour temperature and software brightness for each
+screen, so one monitor can be warm while another stays neutral.
 
 ## Install
 
