@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+case "${2:-}" in
+  status)
+    exit 0
+    ;;
+  tree)
+    printf '/rs/wl/gammarelay/outputs/DP_2\n'
+    ;;
+  get-property)
+    case "${6:-}" in
+      Temperature) printf 'q 6500\n' ;;
+      Brightness) printf 'd 1.0\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  set-property)
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
