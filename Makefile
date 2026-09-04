@@ -31,7 +31,15 @@ lint:
 	for path in $(QML_IMPORT_PATHS); do \
 		if [ -d "$$path" ]; then qml_import_args+=(-I "$$path"); fi; \
 	done; \
-	if "$(QMLLINT)" --help 2>&1 | grep -q -- '--max-warnings'; then \
+	qmlint_help=$$("$(QMLLINT)" --help 2>&1) || { \
+		printf 'failed to query qmllint options\n' >&2; exit 1; \
+	}; \
+	has_qmllint_option() { grep -Fq -- "$$1" <<<"$$qmlint_help"; }; \
+	if has_qmllint_option '--max-warnings' && \
+		has_qmllint_option '--missing-property' && \
+		has_qmllint_option '--missing-type' && \
+		has_qmllint_option '--signal-handler-parameters' && \
+		has_qmllint_option '--unresolved-type'; then \
 		qml_import_args+=(--max-warnings 0 \
 			--import info \
 			--required info \
@@ -40,11 +48,17 @@ lint:
 			--signal-handler-parameters info \
 			--unqualified info \
 			--unresolved-type info); \
-	else \
+	elif has_qmllint_option '--property' && \
+		has_qmllint_option '--required' && \
+		has_qmllint_option '--signal' && \
+		has_qmllint_option '--type' && \
+		has_qmllint_option '--unqualified'; then \
 		# Qt 6.4 has the older category names and fails on every warning. \
 		# Keep host-provided Quickshell diagnostics informational while still \
 		# failing on parser/compiler errors. \
 		qml_import_args+=(--import info --property info --required info --signal info --type info --unqualified info); \
+	else \
+		printf 'unsupported qmllint command-line interface\n' >&2; exit 1; \
 	fi; \
 	"$(QMLLINT)" "$${qml_import_args[@]}" Panel.qml
 
