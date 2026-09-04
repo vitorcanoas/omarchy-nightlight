@@ -1,7 +1,8 @@
 # Omarchy Night Light — complete guide
 
-This guide contains the detailed reference for the plugin. For the short
-installation path, see the [main README](../README.md).
+This is the detailed reference for the plugin. If you have not installed it
+yet, start with the [main README](../README.md) for the two-command setup and
+first use.
 
 ## Overview
 
@@ -21,13 +22,9 @@ Kelvin = 6500 - (53 x percent)
 The plugin stores the selected percentage for each output and restores it when
 requested. It does not require a network connection.
 
-![Night Light in the Omarchy bar](../preview.png)
-
-![Night Light panel](../panel.png)
-
 ![Night Light drawer](../drawer.png)
 
-## Requirements and conflicts
+## Before you start
 
 - Omarchy 4 with its Quickshell desktop (`omarchy-shell`)
 - [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs)
@@ -47,21 +44,20 @@ by GitHub Actions; it is not a runtime requirement for the plugin.
 
 Omarchy's built-in night light uses `hyprsunset`, while this plugin uses
 `wl-gammarelay-rs`. Both claim the Wayland `wlr-gamma-control` protocol, so
-only one provider should control a given output. If the panel shows an error
-or a slider has no visible effect, stop the competing provider:
+only one provider should control a given output. Do not enable the native night
+light with `omarchy toggle nightlight` while using this plugin. If you added
+`hyprsunset` to your own autostart or keybindings, remove those entries too.
+
+To test the current session only, stop the competing provider:
 
 ```bash
 pkill hyprsunset
 ```
 
-## Installation
+## Installation details
 
-Install the dependency and add the plugin through Omarchy:
-
-```bash
-omarchy pkg aur add wl-gammarelay-rs
-omarchy plugin add https://github.com/vitorcanoas/omarchy-nightlight.git --enable
-```
+The short installation is in the [main README](../README.md). The details here
+explain what happens after the plugin is enabled.
 
 Enabling the plugin does not change the displays. The widget reads state with
 `--no-start`; the daemon starts only when an action needs it, such as a switch,
@@ -154,7 +150,7 @@ Output names are the ones printed by `hyprctl monitors` (`DP-2`, `HDMI-A-1`,
 and so on). Global commands skip outputs saved at `0`; name an output explicitly
 when you want to change that choice.
 
-## Keybindings and login restore
+## Advanced: keybindings and login restore
 
 Omarchy 4 configures Hyprland in Lua. This example uses the plugin path and
 therefore does not depend on the optional installer:

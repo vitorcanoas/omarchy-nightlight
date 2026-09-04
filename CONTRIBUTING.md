@@ -5,7 +5,7 @@ reviewable and compatible with Omarchy 4.
 
 ## Before you start
 
-Read the [quick-start README](README.md) and the [complete guide](readme/guide.md),
+Read the [quick-start README](README.md) and the [complete guide](docs/guide.md),
 especially the sections on gamma-control ownership, installation and
 development. This plugin runs inside the user's Omarchy shell and its CLI
 controls user-session Wayland state, so changes to startup, IPC, persistence or
@@ -55,12 +55,13 @@ Keep unrelated cleanup out of feature or bug-fix pull requests. Maintainers may
 ask for a smaller split if a pull request mixes code, release and documentation
 changes.
 
-## Review expectations
+## Merge expectations
 
-Reviewers should check correctness, lifecycle behaviour, compatibility with
-Omarchy conventions, user-facing documentation and unintended display changes.
-Changes that affect process startup, DBus, file writes or shell integration
-should include a focused test or a reproducible manual verification.
+Every pull request must have green CI and a deliberate diff review before it is
+merged. This is a solo-maintained project, so an external approval is welcome
+but not required. Changes that affect process startup, DBus, file writes or
+shell integration should include a focused test or a reproducible manual
+verification.
 
 ## License
 
