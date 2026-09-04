@@ -31,6 +31,11 @@
 # which allows a single client per output, so they cannot run at the same time:
 # keep hyprsunset out of your autostart if you use this.
 
+# The supervisor's signal handler is invoked indirectly through `trap`, and
+# the early supervisor branch makes the rest of this script look unreachable
+# to ShellCheck's control-flow analysis. Both are intentional.
+# shellcheck disable=SC2317
+
 set -uo pipefail
 
 # Set by the --no-save flag. A slider being dragged applies a new temperature
