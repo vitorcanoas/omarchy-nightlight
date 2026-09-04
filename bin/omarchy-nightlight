@@ -260,15 +260,10 @@ ensure_daemon() {
 
   # Prefer uwsm-app so the daemon lands in the compositor's own systemd scope
   # and dies with the session; fall back to a bare setsid where uwsm is absent.
-  # 8>&- is load-bearing. Without it the daemon inherits the open lock file
-  # description and holds the exclusive lock for its entire life, so the NEXT
-  # invocation blocks on the daemon -- not on us -- for the full flock timeout,
-  # then proceeds unserialised anyway. That turned a millisecond race into a
-  # ten-second stall that still did not serialise.
   if command -v uwsm-app >/dev/null 2>&1; then
-    setsid uwsm-app -- wl-gammarelay-rs >/dev/null 2>&1 8>&- &
+    setsid uwsm-app -- wl-gammarelay-rs >/dev/null 2>&1 &
   else
-    setsid wl-gammarelay-rs >/dev/null 2>&1 8>&- &
+    setsid wl-gammarelay-rs >/dev/null 2>&1 &
   fi
 
   wait_for_bus
@@ -400,19 +395,19 @@ saved_pct() {
 save_pct() { save_key "$1" "$2"; }
 save_brightness_pct() { save_key "$1.brightness" "$2"; }
 
-# Serialised with flock because the write is read-modify-write, and the two
-# writers here are genuinely concurrent: a `+5` keybinding can fire while a
-# slider is being released. Without the lock both read the old file and the
-# loser's key vanishes from it. The mv below is already atomic; this is what
-# makes the read-then-write around it atomic too.
+# Serialised with a private directory lock because the write is read-modify-
+# write, and the two writers here are genuinely concurrent: a `+5` keybinding
+# can fire while a slider is being released. Without the lock both read the old
+# file and the loser's key vanishes from it. The mv below is already atomic;
+# this is what makes the read-then-write around it atomic too.
 save_key() {
   local out=$1 pct=$2
   mkdir -p "$(dirname "$CONF")"
   prepare_runtime_dir || return 1
-  # -w rather than a bare flock: a writer wedged while holding the lock used to
-  # block every later invocation forever. The widget has a 15s watchdog for that
-  # (see Panel.qml), but a keybinding has nothing and simply hangs. Five seconds
-  # is far longer than an honest write takes, and it ends.
+  # acquire_lock has a bounded wait: a writer wedged while holding the lock
+  # must not block every later invocation forever. The widget has a 15s
+  # watchdog for that (see Panel.qml), but a keybinding has nothing and simply
+  # hangs. Five seconds is far longer than an honest write takes, and it ends.
   ( acquire_lock "$LOCK" || exit 1
     # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
     cleanup_write_lock() {
@@ -751,7 +746,7 @@ doctor() {
       else
         doctor_add_check runtime 0 "fallback exists but is not user-owned/private: $runtime_candidate"
       fi
-    elif [[ -d /tmp && -w /tmp && -k /tmp ]]; then
+    elif [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]]; then
       doctor_add_check runtime 1 "secure per-user fallback will be created: $runtime_candidate"
     else
       doctor_add_check runtime 0 "cannot create a private runtime fallback under /tmp"

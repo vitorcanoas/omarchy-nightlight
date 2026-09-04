@@ -27,6 +27,18 @@ run_cli_fake_bus_without_runtime() {
     "$CLI" "$@"
 }
 
+run_cli_fake_bus_with_runtime() {
+  local runtime=$1
+  shift
+  env -i \
+    HOME="$TEST_DIR/home" \
+    XDG_CONFIG_HOME="$TEST_DIR/config" \
+    XDG_RUNTIME_DIR="$runtime" \
+    FAKE_BUSCTL_NO_DAEMON=1 \
+    PATH="$(dirname "$FAKE_BUSCTL"):/usr/bin:/bin" \
+    "$CLI" "$@"
+}
+
 help_output=$(run_cli --help)
 [[ $help_output == *"Usage:"* ]]
 [[ $help_output == *"--json"* ]]
@@ -90,17 +102,18 @@ if run_cli --no-start unknown >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
 fi
 grep -q 'omarchy-nightlight:' "$TEST_DIR/stderr"
 
-fallback_lock="/tmp/omarchy-nightlight-$(id -u)"
-if [[ ! -e "$fallback_lock" && ! -L "$fallback_lock" ]]; then
-  foreign_target="$TEST_DIR/foreign-target"
-  : > "$foreign_target"
-  ln -s "$foreign_target" "$fallback_lock"
-  if run_cli_fake_bus_without_runtime brightness 80 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
-    echo 'brightness unexpectedly succeeded through a fallback lock symlink' >&2
-    exit 1
-  fi
-  [[ ! -e "$TEST_DIR/config/omarchy/nightlight.conf" ]]
-  unlink "$fallback_lock"
+fallback_runtime="$TEST_DIR/fallback-runtime"
+mkdir -p "$fallback_runtime"
+chmod 700 "$fallback_runtime"
+foreign_target="$TEST_DIR/foreign-target"
+: > "$foreign_target"
+fallback_lock="$fallback_runtime/omarchy-nightlight.daemon.lock.d"
+ln -s "$foreign_target" "$fallback_lock"
+if run_cli_fake_bus_with_runtime "$fallback_runtime" brightness 80 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
+  echo 'brightness unexpectedly succeeded through a runtime lock symlink' >&2
+  exit 1
 fi
+[[ ! -e "$TEST_DIR/config/omarchy/nightlight.conf" ]]
+[[ -L "$fallback_lock" ]]
 
 echo 'CLI tests passed'

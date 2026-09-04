@@ -13,8 +13,8 @@
 #     rm -f ~/.local/bin/omarchy-nightlight
 #
 # The plugin itself also writes ~/.config/omarchy/nightlight.conf (your saved
-# percentages) and two empty lock files under $XDG_RUNTIME_DIR. The README's
-# Uninstall section lists all of it.
+# percentages) and two short-lived private lock directories under
+# $XDG_RUNTIME_DIR. The README's Uninstall section lists all of it.
 
 set -euo pipefail
 
