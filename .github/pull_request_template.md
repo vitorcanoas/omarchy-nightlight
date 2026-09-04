@@ -35,6 +35,6 @@
 - [ ] User-facing commands and paths were checked.
 - [ ] Screenshots or terminal output attached when useful.
 
-## Reviewer notes
+## Maintainer notes
 
 <!-- Mention trade-offs, known limitations or follow-up work. -->
