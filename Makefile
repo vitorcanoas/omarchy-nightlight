@@ -1,6 +1,9 @@
+SHELL := /bin/bash
+
 PLUGIN_DIR ?= $(HOME)/.config/omarchy/plugins/vitorcanoas.nightlight
 QMLLINT ?= /usr/lib/qt6/bin/qmllint
 OMARCHY_PATH ?= /usr/share/omarchy
+QML_IMPORT_PATHS ?= /usr/lib/qt6/qml /usr/lib/x86_64-linux-gnu/qt6/qml
 
 .PHONY: validate lint test test-model test-cli shellcheck dev
 
@@ -24,7 +27,11 @@ lint:
 	}; \
 	mkdir -p .lint; \
 	ln -s "$(OMARCHY_PATH)/shell" .lint/qs; \
-	"$(QMLLINT)" -I .lint -I /usr/lib/qt6/qml Panel.qml
+	qml_import_args=(-I .lint); \
+	for path in $(QML_IMPORT_PATHS); do \
+		if [ -d "$$path" ]; then qml_import_args+=(-I "$$path"); fi; \
+	done; \
+	"$(QMLLINT)" "$${qml_import_args[@]}" Panel.qml
 
 test: test-model test-cli
 
