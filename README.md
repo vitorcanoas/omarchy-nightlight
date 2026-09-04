@@ -17,6 +17,9 @@ omarchy pkg aur add wl-gammarelay-rs
 omarchy plugin add https://github.com/vitorcanoas/omarchy-nightlight.git --enable
 ```
 
+The plugin also uses Python 3 and standard system utilities already present on
+Omarchy for bounded, atomic configuration persistence.
+
 Omarchy is Arch-based. If you prefer, `yay -S wl-gammarelay-rs` does the same
 thing.
 

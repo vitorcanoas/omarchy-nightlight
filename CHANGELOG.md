@@ -4,7 +4,12 @@ All notable changes to Omarchy Night Light are documented here.
 
 ## [Unreleased]
 
-No changes yet.
+### Fixed
+
+- Harden configuration persistence against symlinks, special files, oversized
+  input and concurrent replacement, with bounded atomic writes.
+- Bound DBus/process output and terminate the complete CLI process group when a
+  panel operation times out.
 
 ## [1.0.1] - 2026-09-03
 
