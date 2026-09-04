@@ -5,10 +5,11 @@ reviewable and compatible with Omarchy 4.
 
 ## Before you start
 
-Read the [README](README.md), especially the sections on gamma-control
-ownership, installation and development. This plugin runs inside the user's
-Omarchy shell and its CLI controls user-session Wayland state, so changes to
-startup, IPC, persistence or process handling need extra care.
+Read the [quick-start README](README.md) and the [complete guide](readme/guide.md),
+especially the sections on gamma-control ownership, installation and
+development. This plugin runs inside the user's Omarchy shell and its CLI
+controls user-session Wayland state, so changes to startup, IPC, persistence or
+process handling need extra care.
 
 ## Development setup
 
