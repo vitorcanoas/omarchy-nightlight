@@ -47,6 +47,11 @@ NO_SAVE=0
 # asks for something.
 NO_START=0
 
+# Suppress human status output for the QML apply process. Errors still go to
+# stderr, and the state read remains JSON, so a quiet write cannot fill a QML
+# collector with unbounded success text.
+QUIET=0
+
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/nightlight.conf"
 
 # Resolve the real plugin directory so `version` also works when the optional
@@ -58,6 +63,55 @@ if command -v readlink >/dev/null 2>&1; then
 fi
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
 MANIFEST="$SCRIPT_DIR/../manifest.json"
+CONFIG_HELPER="$SCRIPT_DIR/omarchy-nightlight-config.py"
+
+# QML's Process owns this script, not the short-lived busctl helpers it starts.
+# Run the real invocation in its own session/process group and keep this small
+# supervisor as the process QML signals. A timeout or dismissal can then tear
+# down the whole group and reap it instead of orphaning a pipeline behind the
+# shell. The child uses the normal traps below; the supervisor only forwards
+# termination and returns the child's status.
+if [[ ${OMARCHY_NIGHTLIGHT_SUPERVISOR:-0} != 1 ]]; then
+  if ! command -v setsid >/dev/null 2>&1 || ! command -v ps >/dev/null 2>&1; then
+    printf 'omarchy-nightlight: setsid and ps are required for process cleanup\n' >&2
+    exit 1
+  fi
+  child_pid=0
+  child_pgid=0
+  child_killer_pid=0
+  supervisor_pgid=$(ps -o pgid= -p "$$" 2>/dev/null || true)
+  supervisor_pgid=${supervisor_pgid//[[:space:]]/}
+  forward_child_signal() {
+    if (( child_pid > 0 )); then
+      if [[ ${child_pgid:-0} =~ ^[1-9][0-9]*$ ]]; then
+        kill -TERM -- "-$child_pgid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
+        ( LC_ALL=C sleep 1; kill -KILL -- "-$child_pgid" 2>/dev/null || true ) &
+        child_killer_pid=$!
+      else
+        kill -TERM "$child_pid" 2>/dev/null || true
+      fi
+      wait "$child_pid" 2>/dev/null || true
+      if (( child_killer_pid > 0 )); then
+        kill -TERM "$child_killer_pid" 2>/dev/null || true
+        wait "$child_killer_pid" 2>/dev/null || true
+      fi
+    fi
+    exit 143
+  }
+  trap forward_child_signal INT TERM HUP
+  OMARCHY_NIGHTLIGHT_SUPERVISOR=1 setsid -- "$SCRIPT_PATH" "$@" &
+  child_pid=$!
+  for _ in {1..50}; do
+    child_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null || true)
+    child_pgid=${child_pgid//[[:space:]]/}
+    [[ $child_pgid =~ ^[0-9]+$ && $child_pgid != "$supervisor_pgid" ]] && break
+    LC_ALL=C sleep 0.01 || break
+  done
+  wait "$child_pid"
+  child_status=$?
+  trap - INT TERM HUP
+  exit "$child_status"
+fi
 
 # Locks are resolved lazily. This lets all read-only commands, including
 # `doctor`, remain read-only. The lock paths are directories created with mkdir,
@@ -65,13 +119,6 @@ MANIFEST="$SCRIPT_DIR/../manifest.json"
 RUNTIME_DIR=""
 LOCK=""
 DAEMON_LOCK=""
-
-# The temp file is named from our PID, so this reaches it from anywhere. A
-# RETURN trap inside the writing function was not enough: RETURN fires on a
-# function returning, and the widget does not wait for that -- its watchdog
-# SIGTERMs this process outright, which is exactly the case that used to strand
-# `nightlight.conf.tmp.<pid>` in the user's config folder forever.
-trap 'rm -f "$CONF.tmp.$$"' EXIT INT TERM
 SERVICE="rs.wl-gammarelay"
 IFACE="rs.wl.gammarelay"
 NEUTRAL=6500       # 0% on the Windows scale
@@ -185,6 +232,9 @@ release_lock() {
 # to tell "applied" from "the daemon ignored me".
 FAILED=0
 LOCK_FAILURE=0
+CONFIG_STATE=unloaded
+CONFIG_ERROR=""
+declare -A CONFIG_VALUES=()
 
 # The scale is linear in Kelvin, deliberately. The eye perceives colour
 # temperature closer to linearly in mireds (a million over Kelvin), so the warm
@@ -208,7 +258,7 @@ to_human() { echo "${1//_/-}"; }
 # output. Normally your autostart brings it up; this is only a safety net for
 # someone running the command with it closed.
 ensure_daemon() {
-  busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
+  bounded_busctl status "$SERVICE" >/dev/null 2>&1 && return 0
   (( NO_START )) && return 1
 
   command -v wl-gammarelay-rs >/dev/null 2>&1 || return 1
@@ -227,7 +277,7 @@ ensure_daemon() {
   acquire_lock "$DAEMON_LOCK" || { LOCK_FAILURE=1; return 1; }
 
   # Whoever we queued behind may have started it while we waited.
-  if busctl --user status "$SERVICE" >/dev/null 2>&1; then
+  if bounded_busctl status "$SERVICE" >/dev/null 2>&1; then
     release_lock "$DAEMON_LOCK"
     return 0
   fi
@@ -285,7 +335,7 @@ wait_for_bus() {
   local ms=100
   for _ in {1..6}; do
     LC_ALL=C sleep "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))" || return 1
-    busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
+    bounded_busctl status "$SERVICE" >/dev/null 2>&1 && return 0
     ms=$(( ms * 18 / 10 ))
   done
   return 1
@@ -311,15 +361,49 @@ daemon_problem() {
 # The outputs that exist right now, in human names (DP-2, HDMI-A-1...).
 # Resolved once per run into ALL_OUTPUTS below: this used to re-shell busctl on
 # every call, which on a slider drag meant hundreds of forks a second.
+MAX_BUS_OUTPUT_BYTES=65536
+MAX_OUTPUTS=64
+MAX_OUTPUT_NAME_BYTES=64
+BUS_TIMEOUT_SECONDS=5
+
+# A DBus peer is outside this process. Keep every reply bounded before it reaches
+# a shell variable or a QML stream, and put a real deadline around the producer.
+# The extra byte distinguishes a reply at the limit from one that was truncated;
+# pipefail turns an early producer exit (normally SIGPIPE) into a failure.
+bounded_busctl() {
+  local data status
+  data=$(timeout --foreground --kill-after=1s "${BUS_TIMEOUT_SECONDS}s" \
+    busctl --user "$@" 2>/dev/null | head -c "$(( MAX_BUS_OUTPUT_BYTES + 1 ))")
+  status=$?
+  (( status == 0 )) || return 1
+  (( ${#data} <= MAX_BUS_OUTPUT_BYTES )) || return 1
+  printf '%s' "$data"
+}
+
 outputs_uncached() {
-  busctl --user tree "$SERVICE" 2>/dev/null |
-    grep -oE '/outputs/[A-Za-z0-9_]+' | sed 's|/outputs/||' | while read -r o; do
-      to_human "$o"
-    done
+  local tree line dbus_output output count=0
+  local -A seen=()
+  tree=$(bounded_busctl tree "$SERVICE") || return 1
+  while IFS= read -r line; do
+    [[ $line =~ /outputs/([A-Za-z0-9_]+) ]] || continue
+    dbus_output=${BASH_REMATCH[1]}
+    (( ${#dbus_output} <= MAX_OUTPUT_NAME_BYTES )) || return 1
+    output=${dbus_output//_/-}
+    [[ ${seen[$output]+present} ]] && continue
+    (( count < MAX_OUTPUTS )) || return 1
+    seen[$output]=1
+    printf '%s\n' "$output"
+    (( count += 1 ))
+  done <<< "$tree"
 }
 
 kelvin_of() {
-  get_prop "$1" Temperature | grep -oE '[0-9]+' | head -n1
+  local raw type value extra=""
+  raw=$(get_prop "$1" Temperature) || return 1
+  [[ $raw != *$'\n'* ]] || return 1
+  read -r type value extra <<< "$raw"
+  [[ $type == q && $value =~ ^[0-9]{1,5}$ && -z $extra ]] || return 1
+  printf '%d\n' "$value"
 }
 
 # One writer for every per-output property wl-gammarelay-rs exposes. Generic
@@ -327,11 +411,13 @@ kelvin_of() {
 # same object with the same call shape; only the first two are wired up here,
 # but adding another is a line rather than a new function.
 set_prop() {
-  busctl --user set-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2" "$3" "$4" >/dev/null 2>&1
+  timeout --foreground --kill-after=1s "${BUS_TIMEOUT_SECONDS}s" \
+    busctl --user set-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2" "$3" "$4" \
+    >/dev/null 2>&1
 }
 
 get_prop() {
-  busctl --user get-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2" 2>/dev/null
+  bounded_busctl get-property "$SERVICE" "/outputs/$(to_dbus "$1")" "$IFACE" "$2"
 }
 
 set_kelvin() { set_prop "$1" Temperature q "$2"; }
@@ -351,8 +437,11 @@ set_brightness() {
 }
 
 brightness_of() {
-  local raw; raw=$(get_prop "$1" Brightness)
-  [[ -z $raw ]] && return 1
+  local raw type value extra=""
+  raw=$(get_prop "$1" Brightness) || return 1
+  [[ $raw != *$'\n'* ]] || return 1
+  read -r type value extra <<< "$raw"
+  [[ $type == d && $value =~ ^[0-9]+([.][0-9]+)?$ && -z $extra ]] || return 1
   # `busctl` prints `d 0.8`; turn that into whole percent without needing bc.
   awk '{ printf "%d", ($NF * 100) + 0.5 }' <<<"$raw"
 }
@@ -367,18 +456,17 @@ brightness_of() {
 # "zero is written" are different things: `restore` at login may only touch an
 # output the user has actually chosen at some point.
 pct_in_file() {
-  [[ -f $CONF ]] || return 1
-  local p; p=$(grep -oP "^\s*$1\s*=\s*\K[0-9]+" "$CONF" | tail -n1)
-  [[ -n $p ]] && echo "$p"
+  config_load || return 1
+  [[ ${CONFIG_VALUES["$1"]+present} ]] && printf '%s\n' "${CONFIG_VALUES["$1"]}"
 }
 
 # Brightness is stored under a second key per output, `DP-2.brightness=80`, so
 # an old config with only temperature lines still reads correctly and a screen
 # that never had its brightness touched simply has no line.
 brightness_in_file() {
-  [[ -f $CONF ]] || return 1
-  local b; b=$(grep -oP "^\s*$1\.brightness\s*=\s*\K[0-9]+" "$CONF" | tail -n1)
-  [[ -n $b ]] && echo "$b"
+  config_load || return 1
+  [[ ${CONFIG_VALUES["$1.brightness"]+present} ]] \
+    && printf '%s\n' "${CONFIG_VALUES["$1.brightness"]}"
 }
 
 # shellcheck disable=SC2317 # called by dynamically selected CLI operations
@@ -395,14 +483,52 @@ saved_pct() {
 save_pct() { save_key "$1" "$2"; }
 save_brightness_pct() { save_key "$1.brightness" "$2"; }
 
+# Parse the saved state once per invocation through the bounded, descriptor-
+# relative helper. An unsafe file is not treated as empty: callers get the
+# documented default where appropriate, while CONFIG_ERROR makes the JSON and
+# human output explain why the saved state was not trusted.
+config_load() {
+  case "$CONFIG_STATE" in
+    loaded) return 0 ;;
+    error) return 1 ;;
+  esac
+
+  local data key value
+  if ! data=$(python3 "$CONFIG_HELPER" read "$CONF" 2>/dev/null); then
+    CONFIG_ERROR="saved configuration is unavailable or unsafe"
+    CONFIG_STATE=error
+    return 1
+  fi
+
+  CONFIG_VALUES=()
+  while IFS=$'\t' read -r key value; do
+    [[ -z $key ]] && continue
+    if [[ ! $key =~ ^[A-Za-z0-9_-]+(\.brightness)?$ || ! $value =~ ^[0-9]{1,3}$ ]]; then
+      CONFIG_ERROR="saved configuration contains an invalid entry"
+      CONFIG_STATE=error
+      CONFIG_VALUES=()
+      return 1
+    fi
+    CONFIG_VALUES["$key"]=$value
+  done <<< "$data"
+  CONFIG_STATE=loaded
+  return 0
+}
+
+config_required() {
+  config_load && return 0
+  warn "$CONFIG_ERROR"
+  FAILED=1
+  return 1
+}
+
 # Serialised with a private directory lock because the write is read-modify-
 # write, and the two writers here are genuinely concurrent: a `+5` keybinding
 # can fire while a slider is being released. Without the lock both read the old
-# file and the loser's key vanishes from it. The mv below is already atomic;
-# this is what makes the read-then-write around it atomic too.
+# file and the loser's key vanishes from it. The helper performs the complete
+# read-modify-write while holding the lock.
 save_key() {
   local out=$1 pct=$2
-  mkdir -p "$(dirname "$CONF")"
   prepare_runtime_dir || return 1
   # acquire_lock has a bounded wait: a writer wedged while holding the lock
   # must not block every later invocation forever. The widget has a 15s
@@ -411,7 +537,6 @@ save_key() {
   ( acquire_lock "$LOCK" || exit 1
     # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
     cleanup_write_lock() {
-      rm -f "$CONF.tmp.$$"
       release_lock "$LOCK"
     }
     trap cleanup_write_lock EXIT
@@ -419,94 +544,19 @@ save_key() {
     trap 'exit 143' TERM
     save_key_locked "$out" "$pct"
   )
+  local status=$?
+  if (( status == 0 )); then
+    CONFIG_STATE=unloaded
+    CONFIG_ERROR=""
+    CONFIG_VALUES=()
+  fi
+  return "$status"
 }
 
 save_key_locked() {
   local out=$1 pct=$2
-  if [[ ! -f $CONF ]]; then
-    cat > "$CONF" <<EOF || return 1
-# Night light: per-output intensity, in percent.
-#
-# Same scale as the Windows slider: 0 = neutral, 100 = maximum.
-# Kelvin = 6500 - (53 x percent).
-#
-# Written by \`omarchy-nightlight\`. You can edit it by hand, but the easy way
-# is \`omarchy-nightlight DP-2 40\`, which also applies it right away.
-#
-# The output name is the same one \`hyprctl monitors\` prints.
-EOF
-  fi
-
-  # Write a whole new file and rename it over the old one. rename(2) is atomic:
-  # a reader sees the old file or the new one, never half of either.
-  #
-  # But atomically promoting a BAD file is just a reliable way to lose data, and
-  # that is what used to happen. None of the commands building the temp file had
-  # their exit status checked, so an unreadable config (mode 000, or a full
-  # disk) produced a one-line temp that `mv` then promoted over the real thing --
-  # exit 0, "success" printed, every other screen's setting gone. `mv` only
-  # needs write permission on the directory, so it had no trouble doing it.
-  local tmp="$CONF.tmp.$$"
-
-  # awk rather than sed, for three reasons the sed version got wrong:
-  #
-  #  - It rewrites the VALUE and keeps anything the user wrote after it. A
-  #    whole-line replace ate trailing comments, and the header above invites
-  #    hand-editing; worse, the size guard below then read that shrink as data
-  #    loss and refused every future save, permanently.
-  #  - It replaces the value whatever the value looks like. The old pair
-  #    disagreed with itself -- grep decided the key existed on `key\s*=`, sed
-  #    only rewrote a value matching `[0-9]+` -- so `DP-2=` or `DP-2=abc` made
-  #    sed copy the file verbatim and exit 0. save_key reported success having
-  #    written nothing, and the setting silently vanished at the next login.
-  #  - It appends through a record, so a config with no trailing newline gets
-  #    one instead of producing `DP-2=40DP-9=30`, which no reader could parse.
-  #
-  # Every matching line is rewritten, not just the first: leaving a stale
-  # duplicate behind would make the read-back below disagree with itself.
-  awk -v key="$out" -v val="$pct" '
-    BEGIN { pat = "^[ \t]*" key "[ \t]*=" ; found = 0 }
-    {
-      if ($0 ~ pat) {
-        found = 1
-        match($0, pat)
-        head = substr($0, 1, RLENGTH)
-        rest = substr($0, RLENGTH + 1)
-        hash = index(rest, "#")
-        if (hash > 0) print head val " " substr(rest, hash)
-        else print head val
-        next
-      }
-      print
-    }
-    END { if (!found) print key "=" val }
-  ' "$CONF" >"$tmp" 2>/dev/null || return 1
-
-  # A temp file smaller than the original means content was lost on the way,
-  # whatever the exit codes said. Refuse rather than promote it.
-  local old_size new_size
-  old_size=$(wc -c <"$CONF" 2>/dev/null) || return 1
-  new_size=$(wc -c <"$tmp" 2>/dev/null) || return 1
-  if (( new_size < old_size - 8 )); then
-    return 1
-  fi
-
-  # Read the value back out of the temp before promoting it. If what we are
-  # about to install does not say what we were asked to write, nothing else in
-  # here gets to call this a success.
-  #
-  # awk again, not `grep -oP`: the read path already degrades where grep is
-  # built without PCRE, and asserting with -P here would have turned that
-  # degradation into a hard failure of every save on such a machine.
-  local written
-  written=$(awk -v key="$out" '
-    BEGIN { pat = "^[ \t]*" key "[ \t]*=[ \t]*" ; v = "" }
-    $0 ~ pat { line = $0; sub(pat, "", line); sub(/[^0-9].*$/, "", line); v = line }
-    END { print v }
-  ' "$tmp" 2>/dev/null)
-  [[ $written == "$pct" ]] || return 1
-
-  mv -f "$tmp" "$CONF" || return 1
+  python3 "$CONFIG_HELPER" write "$CONF" "$out" "$pct" || return 1
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -687,7 +737,7 @@ doctor_add_check() {
 doctor() {
   local format=0 dep path version missing="" runtime_candidate
   local config_dir config_detail daemon_detail
-  local -a required=(busctl awk grep sed head pgrep sleep mkdir mv stat readlink rm rmdir cat wc dirname kill setsid date)
+  local -a required=(busctl awk grep sed head pgrep sleep mkdir stat readlink rm rmdir cat dirname kill setsid ps date python3 timeout)
   local -a doctor_names=() doctor_oks=() doctor_details=()
   local doctor_failed=0
   [[ ${1:-} == --json ]] && format=1
@@ -710,7 +760,7 @@ doctor() {
     doctor_add_check cli 0 "CLI is not executable: $SCRIPT_PATH"
   fi
 
-  if command -v busctl >/dev/null 2>&1 && busctl --user status "$SERVICE" >/dev/null 2>&1; then
+  if command -v busctl >/dev/null 2>&1 && bounded_busctl status "$SERVICE" >/dev/null 2>&1; then
     daemon_detail="running"
     doctor_add_check daemon 1 "$daemon_detail"
   else
@@ -719,14 +769,15 @@ doctor() {
   fi
 
   config_dir=$(dirname -- "$CONF")
-  if [[ -f $CONF && -r $CONF && -O $CONF ]]; then
-    config_detail="readable user-owned config: $CONF"
-    doctor_add_check config 1 "$config_detail"
-  elif [[ ! -e $CONF && ! -L $CONF && -d $config_dir && -w $config_dir ]]; then
-    config_detail="not created yet; writable parent: $config_dir"
+  if python3 "$CONFIG_HELPER" check "$CONF" >/dev/null 2>&1; then
+    if [[ -e $CONF ]]; then
+      config_detail="readable, user-owned, regular config: $CONF"
+    else
+      config_detail="not created yet; writable parent will be checked on first write: $config_dir"
+    fi
     doctor_add_check config 1 "$config_detail"
   else
-    config_detail="config is missing, unreadable, not user-owned, or parent is not writable: $CONF"
+    config_detail="config is missing, unreadable, unsafe, or parent is not writable: $CONF"
     doctor_add_check config 0 "$config_detail"
   fi
 
@@ -804,9 +855,21 @@ version_command() {
 }
 
 # ---------------------------------------------------------------------------
-show() {
-  local o k b warning
+warning_text() {
+  local warning
   warning=$(conflict_warning)
+  if [[ -n $CONFIG_ERROR ]]; then
+    [[ -n $warning ]] && warning+=" "
+    warning+="$CONFIG_ERROR"
+  fi
+  printf '%s' "$warning"
+}
+
+show() {
+  (( QUIET )) && return 0
+  local o k b warning
+  config_load || true
+  warning=$(warning_text)
   [[ -n $warning ]] && printf 'warning: %s\n\n' "$warning" >&2
   for o in $(outputs); do
     k=$(kelvin_of "$o")
@@ -821,8 +884,10 @@ show() {
 
 # The contract the bar widget reads. Keep the key names stable.
 json() {
-  local o k b pct on configured first=1
-  printf '{"warning":"%s","daemon":true,"outputs":[' "$(conflict_warning)"
+  local o k b pct on configured first=1 warning
+  config_load || true
+  warning=$(warning_text)
+  printf '{"warning":"%s","daemon":true,"outputs":[' "$warning"
   for o in $(outputs); do
     # One read of the temperature, reused for both the value and the on/off
     # decision. Calling is_on here meant a second busctl round trip per screen.
@@ -847,6 +912,7 @@ for arg in "$@"; do
   case $arg in
     --no-save)  NO_SAVE=1 ;;
     --no-start) NO_START=1 ;;
+    --quiet)    QUIET=1 ;;
     *)          ARGS+=("$arg") ;;
   esac
 done
@@ -960,8 +1026,14 @@ if ! ensure_daemon; then
   esac
 fi
 
-# Listed once, then served from memory for the rest of the run.
-mapfile -t ALL_OUTPUTS < <(outputs_uncached)
+# Listed once, then served from memory for the rest of the run. A malformed or
+# oversized DBus reply is an error, never an empty output list that could make a
+# mutating command silently skip every monitor.
+ALL_OUTPUTS=()
+output_list=$(outputs_uncached) || die "could not safely enumerate wl-gammarelay-rs outputs"
+if [[ -n $output_list ]]; then
+  mapfile -t ALL_OUTPUTS <<< "$output_list"
+fi
 outputs() { (( ${#ALL_OUTPUTS[@]} )) && printf '%s\n' "${ALL_OUTPUTS[@]}"; return 0; }
 
 # If the first argument names an output, the command applies to it alone.
@@ -1044,28 +1116,32 @@ case "$ACTION" in
     # choice are touched at all, so on a machine that never configured night
     # light nothing is applied and the autostart line stays harmless — that is
     # what lets you version one autostart across every machine.
-    for o in "${TARGETS[@]}"; do
-      b=$(brightness_in_file "$o") && { set_brightness "$b" "$o" || { warn "could not set brightness on $o"; FAILED=1; }; }
-      p=$(pct_in_file "$o") || continue
-      # A screen written as 0 is meant to be neutral, so say so rather than
-      # leaving whatever ramp happened to be loaded. At login that is already
-      # true and this is a no-op; run by hand after an `on` it is the difference
-      # between "restored the file" and "restored most of the file".
-      if (( p > 0 )); then
-        set_kelvin "$o" "$(pct_to_kelvin "$p")" || { warn "could not set the temperature on $o"; FAILED=1; }
-      else
-        go_neutral "$o"
-      fi
-    done ;;
+    if config_required; then
+      for o in "${TARGETS[@]}"; do
+        b=$(brightness_in_file "$o") && { set_brightness "$b" "$o" || { warn "could not set brightness on $o"; FAILED=1; }; }
+        p=$(pct_in_file "$o") || continue
+        # A screen written as 0 is meant to be neutral, so say so rather than
+        # leaving whatever ramp happened to be loaded. At login that is already
+        # true and this is a no-op; run by hand after an `on` it is the difference
+        # between "restored the file" and "restored most of the file".
+        if (( p > 0 )); then
+          set_kelvin "$o" "$(pct_to_kelvin "$p")" || { warn "could not set the temperature on $o"; FAILED=1; }
+        else
+          go_neutral "$o"
+        fi
+      done
+    fi ;;
 
   on)
-    osd_pct=""
-    for o in "${TARGETS[@]}"; do
-      excused "$o" && continue
-      [[ -z $osd_pct ]] && osd_pct=$(on_pct "$o")
-      light_up "$o" "$(on_pct "$o")"
-    done
-    osd "${osd_pct:-0}" "Night light"
+    if config_required; then
+      osd_pct=""
+      for o in "${TARGETS[@]}"; do
+        excused "$o" && continue
+        [[ -z $osd_pct ]] && osd_pct=$(on_pct "$o")
+        light_up "$o" "$(on_pct "$o")"
+      done
+      osd "${osd_pct:-0}" "Night light"
+    fi
     show ;;
 
   off)
@@ -1081,7 +1157,7 @@ case "$ACTION" in
     if (( any )); then
       for o in "${TARGETS[@]}"; do go_neutral "$o"; done
       osd 0 "Night light off"
-    else
+    elif config_required; then
       osd_pct=""
       for o in "${TARGETS[@]}"; do
         excused "$o" && continue
@@ -1119,25 +1195,27 @@ case "$ACTION" in
 
   +[0-9]*|-[0-9]*|[0-9]*)
     [[ $ACTION =~ ^[+-]?[0-9]+$ ]] || die "invalid percentage: $ACTION"
-    relative=0
-    [[ $ACTION == [+-]* ]] && relative=1
-    osd_pct=""
-    for o in "${TARGETS[@]}"; do
-      excused "$o" && continue
-      target=$(resolve_pct "$o" "$ACTION")
-      [[ -z $osd_pct ]] && osd_pct=$target
-      if (( relative && target == 0 )); then
-        # A decrement that runs out of room means "off", not "retire this
-        # screen". Apply neutral and leave the saved intensity where it is, so
-        # the next `on` or `+5` still knows what you had chosen.
-        set_kelvin "$o" "$NEUTRAL" || { warn "could not reach $o"; FAILED=1; }
-      else
-        apply_to "$o" "$target"
-      fi
-    done
-    # The OSD shows the first screen the command actually touched. Reading
-    # TARGETS[0] blindly reported a number for a screen that had been skipped.
-    osd "${osd_pct:-0}" "Night light"
+    if config_required; then
+      relative=0
+      [[ $ACTION == [+-]* ]] && relative=1
+      osd_pct=""
+      for o in "${TARGETS[@]}"; do
+        excused "$o" && continue
+        target=$(resolve_pct "$o" "$ACTION")
+        [[ -z $osd_pct ]] && osd_pct=$target
+        if (( relative && target == 0 )); then
+          # A decrement that runs out of room means "off", not "retire this
+          # screen". Apply neutral and leave the saved intensity where it is, so
+          # the next `on` or `+5` still knows what you had chosen.
+          set_kelvin "$o" "$NEUTRAL" || { warn "could not reach $o"; FAILED=1; }
+        else
+          apply_to "$o" "$target"
+        fi
+      done
+      # The OSD shows the first screen the command actually touched. Reading
+      # TARGETS[0] blindly reported a number for a screen that had been skipped.
+      osd "${osd_pct:-0}" "Night light"
+    fi
     show ;;
 
   *) die "unknown command \"$ACTION\". See 'omarchy-nightlight --help'" ;;

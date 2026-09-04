@@ -238,38 +238,138 @@ Panel {
   // apply. Remember it and run it as soon as the current read lands.
   property bool refreshQueued: false
 
-  // A successful process exit is not enough to trust the state payload. Keep
-  // this until both Process.exited and streamFinished have landed, because
-  // Quickshell does not guarantee their order.
-  property bool statePayloadInvalid: false
+  // The CLI bounds every DBus reply, and the panel bounds what it accepts from
+  // the process as well. SplitParser lets us consume incrementally without a
+  // StdioCollector retaining a complete stdout/stderr stream in memory.
+  readonly property int helperOutputMaxChars: 65536
+  readonly property int helperOutputMaxLines: 128
+  readonly property int helperLineMaxChars: 16384
+  property string stateOutputText: ""
+  property int stateOutputChars: 0
+  property int stateOutputLines: 0
+  property string stateErrorText: ""
+  property int stateErrorChars: 0
+  property int stateErrorLines: 0
+  property bool stateOutputTooLarge: false
+  property bool stateErrorTooLarge: false
+  property bool stateTimedOut: false
   property int stateExitCode: -1
 
-  // Quickshell gives no ordering guarantee between Process.exited and
-  // StdioCollector.streamFinished. Draining the queued refresh from exited
-  // alone let the NEXT read start and move stateReadEpoch before the finished
-  // read's text had even been looked at -- so the stale text was then compared
-  // against the new read's epoch and sailed straight through the guard written
-  // to catch it. Both signals have to land before anything relaunches.
+  // Quickshell can deliver Process.exited before the final SplitParser lines.
+  // Draining the queued refresh from exited alone lets the NEXT read start and
+  // move stateReadEpoch before the finished read's text has been looked at, so
+  // keep completion queued until the event loop has delivered those lines.
   property bool readStreamDone: false
+  property bool stateFinishQueued: false
+
+  property string applyErrorText: ""
+  property int applyErrorChars: 0
+  property int applyErrorLines: 0
+  property bool applyOutputTooLarge: false
+  property bool applyErrorTooLarge: false
+  property bool applyTimedOut: false
+
+  function noteStateOutput(line) {
+    var value = String(line || "")
+    var added = value.length + (root.stateOutputLines > 0 ? 1 : 0)
+    if (value.length > root.helperLineMaxChars ||
+        root.stateOutputLines >= root.helperOutputMaxLines ||
+        root.stateOutputChars + added > root.helperOutputMaxChars) {
+      root.stateOutputTooLarge = true
+      root.terminateProcess(stateProc, "state")
+      return
+    }
+    root.stateOutputText += (root.stateOutputLines > 0 ? "\n" : "") + value
+    root.stateOutputChars += added
+    root.stateOutputLines++
+    if (root.stateExitCode !== -1) root.scheduleFinishRead()
+  }
+
+  function noteStateError(line) {
+    var value = String(line || "")
+    var added = value.length + (root.stateErrorLines > 0 ? 1 : 0)
+    if (value.length > root.helperLineMaxChars ||
+        root.stateErrorLines >= root.helperOutputMaxLines ||
+        root.stateErrorChars + added > root.helperOutputMaxChars) {
+      root.stateErrorTooLarge = true
+      root.terminateProcess(stateProc, "state")
+      return
+    }
+    if (root.stateErrorText === "") root.stateErrorText = value
+    root.stateErrorChars += added
+    root.stateErrorLines++
+  }
+
+  function noteApplyOutput(line) {
+    var value = String(line || "")
+    if (value.length > root.helperLineMaxChars) {
+      root.applyOutputTooLarge = true
+      root.terminateProcess(applyProc, "apply")
+    }
+  }
+
+  function noteApplyError(line) {
+    var value = String(line || "")
+    var added = value.length + (root.applyErrorLines > 0 ? 1 : 0)
+    if (value.length > root.helperLineMaxChars ||
+        root.applyErrorLines >= root.helperOutputMaxLines ||
+        root.applyErrorChars + added > root.helperOutputMaxChars) {
+      root.applyErrorTooLarge = true
+      root.terminateProcess(applyProc, "apply")
+      return
+    }
+    if (root.applyErrorText === "") root.applyErrorText = value
+    root.applyErrorChars += added
+    root.applyErrorLines++
+  }
+
+  function scheduleFinishRead() {
+    if (root.stateFinishQueued) return
+    root.stateFinishQueued = true
+    Qt.callLater(function() {
+      root.stateFinishQueued = false
+      root.finishRead()
+    })
+  }
 
   function refresh() {
     if (stateProc.running) { root.refreshQueued = true; return }
     root.refreshQueued = false
     root.stateReadEpoch = root.stateEpoch
     root.readStreamDone = false
-    root.statePayloadInvalid = false
+    root.stateFinishQueued = false
+    root.stateOutputText = ""
+    root.stateOutputChars = 0
+    root.stateOutputLines = 0
+    root.stateErrorText = ""
+    root.stateErrorChars = 0
+    root.stateErrorLines = 0
+    root.stateOutputTooLarge = false
+    root.stateErrorTooLarge = false
+    root.stateTimedOut = false
     root.stateExitCode = -1
     stateProc.running = true
     root.armWatchdog()
   }
 
-  // Called from both of the read's end signals; acts only once both have landed.
+  // Called after Process.exited and the parser's queued lines have landed.
   function finishRead() {
-    if (stateProc.running || !root.readStreamDone) return
+    if (stateProc.running || root.readStreamDone || root.stateExitCode === -1) return
+    root.readStreamDone = true
     root.armWatchdog()
-    if (root.statePayloadInvalid && root.stateExitCode === 0) {
-      root.publishError("omarchy-nightlight returned invalid state")
-      root.statePayloadInvalid = false
+    if (root.stateTimedOut) {
+      root.publishError("omarchy-nightlight timed out")
+    } else if (root.stateOutputTooLarge || root.stateErrorTooLarge) {
+      root.publishError("omarchy-nightlight returned too much output")
+    } else if (root.stateExitCode !== 0) {
+      root.publishError(Model.clampMessage(root.stateErrorText) || "omarchy-nightlight failed")
+    } else {
+      var state = Model.parseState(root.stateOutputText)
+      if (!state) {
+        root.publishError("omarchy-nightlight returned invalid state")
+      } else if (root.stateReadEpoch === root.stateEpoch) {
+        root.publishState(state.names, state.byName, state.warning)
+      }
     }
     if (root.refreshQueued) Qt.callLater(root.refresh)
   }
@@ -517,7 +617,13 @@ Panel {
     // one entry, and starting it must not clear the entries still waiting.
     root.publishWrite()
     root.runningSchedulePhase = entry.schedulePhase
-    applyProc.command = [root.command].concat(entry.args)
+    root.applyErrorText = ""
+    root.applyErrorChars = 0
+    root.applyErrorLines = 0
+    root.applyOutputTooLarge = false
+    root.applyErrorTooLarge = false
+    root.applyTimedOut = false
+    applyProc.command = [root.command, "--quiet"].concat(entry.args)
     applyProc.running = true
     root.armWatchdog()
   }
@@ -887,9 +993,15 @@ Panel {
     running: false
     repeat: false
     onTriggered: {
-      if (stateProc.running) stateProc.running = false
-      if (applyProc.running) {
-        applyProc.running = false
+      var stoppedState = stateProc.running
+      var stoppedApply = applyProc.running
+      if (stoppedState) {
+        root.stateTimedOut = true
+        root.terminateProcess(stateProc, "state")
+      }
+      if (stoppedApply) {
+        root.applyTimedOut = true
+        root.terminateProcess(applyProc, "apply")
         root.runningSchedulePhase = ""
         // Whatever was queued behind it is stale by now; drop it rather than
         // firing a command the user asked for fifteen seconds ago.
@@ -905,11 +1017,32 @@ Panel {
         return
       }
 
-      // The read that was killed will never deliver a stream, so release the
-      // gate and go get a fresh one rather than sitting on stale state.
-      root.readStreamDone = true
-      root.refreshQueued = false
-      Qt.callLater(root.refresh)
+      // onExited normally performs the recovery. This branch handles a process
+      // that was already exiting when the watchdog fired.
+      if (stoppedState) root.scheduleFinishRead()
+      else if (stoppedApply) root.refresh()
+    }
+  }
+
+  property string killTarget: ""
+
+  function terminateProcess(process, target) {
+    if (!process.running) return
+    root.killTarget = target
+    process.signal(15)
+    processKillTimer.restart()
+  }
+
+  Timer {
+    id: processKillTimer
+    // The CLI supervisor has one second to escalate TERM to the whole child
+    // process group before this last-resort signal reaches the supervisor.
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (root.killTarget === "state" && stateProc.running) stateProc.signal(9)
+      if (root.killTarget === "apply" && applyProc.running) applyProc.signal(9)
+      root.killTarget = ""
     }
   }
 
@@ -951,53 +1084,35 @@ Panel {
     // stopped working for the rest of the session, for a user who never even
     // opened the panel. The daemon starts on the first real request instead.
     command: [root.command, "--json", "--no-start"]
-    stdout: StdioCollector {
-      id: stateOut
-      waitForEnd: true
-      onStreamFinished: {
-        root.readStreamDone = true
-        var state = Model.parseState(text)
-        if (!state) {
-          root.statePayloadInvalid = true
-          root.finishRead()
-          return
-        } // unusable: keep last good state
-        // Written to since this read began: it describes a world that no longer
-        // exists. Drop it; the queued refresh below fetches the real one.
-        if (root.stateReadEpoch !== root.stateEpoch) { root.finishRead(); return }
-        root.publishState(state.names, state.byName, state.warning)
-        root.finishRead()
-      }
-    }
-    stderr: StdioCollector { id: stateErr; waitForEnd: true }
+    stdout: SplitParser { onRead: function(line) { root.noteStateOutput(line) } }
+    stderr: SplitParser { onRead: function(line) { root.noteStateError(line) } }
     onExited: function(exitCode) {
-      root.stateExitCode = exitCode
-      root.armWatchdog()
-      root.finishRead()
-      if (exitCode === 0) {
-        if (root.statePayloadInvalid) {
-          root.publishError("omarchy-nightlight returned invalid state")
-          root.statePayloadInvalid = false
-        }
-        return
+      if (root.killTarget === "state") {
+        processKillTimer.stop()
+        root.killTarget = ""
       }
-      // Missing dependency, dead daemon, hyprsunset holding the outputs: the
-      // CLI explains itself on stderr, so show that rather than a silent
-      // widget. State stays "unknown" instead of showing an invented zero, and
-      // every screen's glyph says the same thing.
-      root.publishError(Model.clampMessage(stateErr.text) || "omarchy-nightlight failed")
+      root.stateExitCode = exitCode
+      root.scheduleFinishRead()
     }
   }
 
   Process {
     id: applyProc
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { id: applyErr; waitForEnd: true }
+    stdout: SplitParser { onRead: function(line) { root.noteApplyOutput(line) } }
+    stderr: SplitParser { onRead: function(line) { root.noteApplyError(line) } }
     onExited: function(exitCode) {
+      if (root.killTarget === "apply") {
+        processKillTimer.stop()
+        root.killTarget = ""
+      }
       var completedSchedulePhase = root.runningSchedulePhase
       root.runningSchedulePhase = ""
-      if (exitCode !== 0)
-        root.publishError(Model.clampMessage(applyErr.text) || "omarchy-nightlight failed")
+      if (root.applyTimedOut)
+        root.publishError("omarchy-nightlight timed out")
+      else if (root.applyOutputTooLarge || root.applyErrorTooLarge)
+        root.publishError("omarchy-nightlight returned too much output")
+      else if (exitCode !== 0)
+        root.publishError(Model.clampMessage(root.applyErrorText) || "omarchy-nightlight failed")
       else if (completedSchedulePhase !== "")
         root.publishPhase(completedSchedulePhase)
 

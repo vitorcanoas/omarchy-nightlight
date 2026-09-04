@@ -28,6 +28,7 @@ requested. It does not require a network connection.
 
 - Omarchy 4 with its Quickshell desktop (`omarchy-shell`)
 - [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs)
+- Python 3 and the standard `timeout`, `setsid` and `ps` utilities
 
 Omarchy is based on Arch Linux. Install the dependency with Omarchy's package
 helper:
@@ -41,6 +42,8 @@ installed. Ubuntu appears in this repository only as the operating system used
 by GitHub Actions; it is not a runtime requirement for the plugin.
 
 `wl-gammarelay-rs` is not part of Omarchy and is not installed by this plugin.
+Python 3 is used internally for bounded, atomic configuration persistence; it
+is not an extra package on a standard Omarchy installation.
 
 Omarchy's built-in night light uses `hyprsunset`, while this plugin uses
 `wl-gammarelay-rs`. Both claim the Wayland `wlr-gamma-control` protocol, so

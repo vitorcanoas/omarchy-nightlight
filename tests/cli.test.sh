@@ -9,6 +9,7 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 FAKE_BUSCTL="$ROOT_DIR/tests/fixtures/busctl"
 
 mkdir -p "$TEST_DIR/home" "$TEST_DIR/config" "$TEST_DIR/runtime" "$TEST_DIR/bin"
+chmod 700 "$TEST_DIR/runtime"
 
 run_cli() {
   env -i \
@@ -35,6 +36,25 @@ run_cli_fake_bus_with_runtime() {
     XDG_CONFIG_HOME="$TEST_DIR/config" \
     XDG_RUNTIME_DIR="$runtime" \
     FAKE_BUSCTL_NO_DAEMON=1 \
+    PATH="$(dirname "$FAKE_BUSCTL"):/usr/bin:/bin" \
+    "$CLI" "$@"
+}
+
+run_cli_fake_bus() {
+  env -i \
+    HOME="$TEST_DIR/home" \
+    XDG_CONFIG_HOME="$TEST_DIR/config" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    PATH="$(dirname "$FAKE_BUSCTL"):/usr/bin:/bin" \
+    "$CLI" "$@"
+}
+
+run_cli_fake_bus_huge() {
+  env -i \
+    HOME="$TEST_DIR/home" \
+    XDG_CONFIG_HOME="$TEST_DIR/config" \
+    XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+    FAKE_BUSCTL_HUGE=1 \
     PATH="$(dirname "$FAKE_BUSCTL"):/usr/bin:/bin" \
     "$CLI" "$@"
 }
@@ -101,6 +121,67 @@ if run_cli --no-start unknown >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
   exit 1
 fi
 grep -q 'omarchy-nightlight:' "$TEST_DIR/stderr"
+
+config_file="$TEST_DIR/config/omarchy/nightlight.conf"
+run_cli_fake_bus brightness 80 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"
+grep -q '^DP-2.brightness=80$' "$config_file"
+
+foreign_config_target="$TEST_DIR/config/foreign-target"
+printf 'DP-2.brightness=55\n' >"$foreign_config_target"
+rm -f "$config_file"
+ln -s "$foreign_config_target" "$config_file"
+if run_cli_fake_bus brightness 70 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
+  echo 'brightness unexpectedly followed a configuration symlink' >&2
+  exit 1
+fi
+[[ -L "$config_file" ]]
+grep -q '^DP-2.brightness=55$' "$foreign_config_target"
+
+rm -f "$config_file"
+mkfifo "$config_file"
+if run_cli_fake_bus brightness 70 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
+  echo 'brightness unexpectedly accepted a configuration FIFO' >&2
+  exit 1
+fi
+[[ -p "$config_file" ]]
+
+rm -f "$config_file"
+dd if=/dev/zero of="$config_file" bs=1024 count=65 status=none
+if run_cli_fake_bus brightness 70 >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
+  echo 'brightness unexpectedly accepted an oversized configuration' >&2
+  exit 1
+fi
+[[ $(wc -c <"$config_file") -eq $((65 * 1024)) ]]
+rm -f "$config_file"
+
+if run_cli_fake_bus_huge --json --no-start >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
+  echo 'CLI unexpectedly accepted an oversized DBus tree' >&2
+  exit 1
+fi
+grep -q 'safely enumerate' "$TEST_DIR/stderr"
+
+hang_pid_file="$TEST_DIR/hang.pid"
+env -i \
+  HOME="$TEST_DIR/home" \
+  XDG_CONFIG_HOME="$TEST_DIR/config" \
+  XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
+  FAKE_BUSCTL_HANG=1 \
+  FAKE_BUSCTL_HANG_PID="$hang_pid_file" \
+  PATH="$(dirname "$FAKE_BUSCTL"):/usr/bin:/bin" \
+  "$CLI" --json --no-start >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr" &
+cli_pid=$!
+for _ in {1..100}; do
+  [[ -s "$hang_pid_file" ]] && break
+  sleep 0.02
+done
+[[ -s "$hang_pid_file" ]]
+kill -TERM "$cli_pid" 2>/dev/null || true
+wait "$cli_pid" 2>/dev/null || true
+hang_pid=$(cat "$hang_pid_file")
+if kill -0 "$hang_pid" 2>/dev/null; then
+  echo 'CLI supervisor left the DBus child alive after termination' >&2
+  exit 1
+fi
 
 fallback_runtime="$TEST_DIR/fallback-runtime"
 mkdir -p "$fallback_runtime"
