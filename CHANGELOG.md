@@ -4,6 +4,10 @@ All notable changes to Omarchy Night Light are documented here.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [1.0.1] - 2026-09-03
+
 ### Fixed
 
 - Keep read-only CLI commands from starting `wl-gammarelay-rs`.
