@@ -238,6 +238,12 @@ Panel {
   // apply. Remember it and run it as soon as the current read lands.
   property bool refreshQueued: false
 
+  // A successful process exit is not enough to trust the state payload. Keep
+  // this until both Process.exited and streamFinished have landed, because
+  // Quickshell does not guarantee their order.
+  property bool statePayloadInvalid: false
+  property int stateExitCode: -1
+
   // Quickshell gives no ordering guarantee between Process.exited and
   // StdioCollector.streamFinished. Draining the queued refresh from exited
   // alone let the NEXT read start and move stateReadEpoch before the finished
@@ -251,6 +257,8 @@ Panel {
     root.refreshQueued = false
     root.stateReadEpoch = root.stateEpoch
     root.readStreamDone = false
+    root.statePayloadInvalid = false
+    root.stateExitCode = -1
     stateProc.running = true
     root.armWatchdog()
   }
@@ -259,6 +267,10 @@ Panel {
   function finishRead() {
     if (stateProc.running || !root.readStreamDone) return
     root.armWatchdog()
+    if (root.statePayloadInvalid && root.stateExitCode === 0) {
+      root.publishError("omarchy-nightlight returned invalid state")
+      root.statePayloadInvalid = false
+    }
     if (root.refreshQueued) Qt.callLater(root.refresh)
   }
 
@@ -396,6 +408,7 @@ Panel {
   // "night" or "day"; empty until the first evaluation. Only a *change* acts, so
   // a manual override between boundaries is left alone until the next one.
   property string schedulePhase: ""
+  property string runningSchedulePhase: ""
 
   // Bumped to force the schedule's text fields to re-read the stored value
   // after a rejected edit.
@@ -463,9 +476,10 @@ Panel {
     var phase = Model.phaseAt(new Date(), root.scheduleOnAt, root.scheduleOffAt)
     if (phase === "") return
     if (!force && phase === root.schedulePhase) return
-    root.publishPhase(phase)
-    if (phase === "night") run([root.scheduleNightPercent > 0 ? String(root.scheduleNightPercent) : "on"])
-    else run(["off"])
+    var args = phase === "night"
+      ? [root.scheduleNightPercent > 0 ? String(root.scheduleNightPercent) : "on"]
+      : ["off"]
+    run(args, phase)
   }
 
   // ---- writing ------------------------------------------------------------
@@ -498,21 +512,27 @@ Panel {
     return root.globalQueueKey
   }
 
-  function run(args) {
+  function startApply(entry) {
+    // This is deliberately separate from run(): onExited has already removed
+    // one entry, and starting it must not clear the entries still waiting.
+    root.publishWrite()
+    root.runningSchedulePhase = entry.schedulePhase
+    applyProc.command = [root.command].concat(entry.args)
+    applyProc.running = true
+    root.armWatchdog()
+  }
+
+  function run(args, schedulePhase) {
+    var entry = { args: args, schedulePhase: String(schedulePhase || "") }
     if (applyProc.running) {
       var next = {}
       for (var key in root.queuedByOutput) next[key] = root.queuedByOutput[key]
-      next[queueKeyFor(args)] = args
+      next[queueKeyFor(args)] = entry
       root.queuedByOutput = next
       return
     }
     root.queuedByOutput = ({})
-    // Any read already in flight, here or on another monitor's instance,
-    // predates this write; mark them all stale.
-    root.publishWrite()
-    applyProc.command = [root.command].concat(args)
-    applyProc.running = true
-    root.armWatchdog()
+    root.startApply(entry)
   }
 
   // Pull one queued command, oldest key first. The rest stay queued and go out
@@ -870,6 +890,7 @@ Panel {
       if (stateProc.running) stateProc.running = false
       if (applyProc.running) {
         applyProc.running = false
+        root.runningSchedulePhase = ""
         // Whatever was queued behind it is stale by now; drop it rather than
         // firing a command the user asked for fifteen seconds ago.
         root.queuedByOutput = ({})
@@ -936,7 +957,11 @@ Panel {
       onStreamFinished: {
         root.readStreamDone = true
         var state = Model.parseState(text)
-        if (!state) { root.finishRead(); return } // unusable: keep last good state
+        if (!state) {
+          root.statePayloadInvalid = true
+          root.finishRead()
+          return
+        } // unusable: keep last good state
         // Written to since this read began: it describes a world that no longer
         // exists. Drop it; the queued refresh below fetches the real one.
         if (root.stateReadEpoch !== root.stateEpoch) { root.finishRead(); return }
@@ -946,9 +971,16 @@ Panel {
     }
     stderr: StdioCollector { id: stateErr; waitForEnd: true }
     onExited: function(exitCode) {
+      root.stateExitCode = exitCode
       root.armWatchdog()
       root.finishRead()
-      if (exitCode === 0) return
+      if (exitCode === 0) {
+        if (root.statePayloadInvalid) {
+          root.publishError("omarchy-nightlight returned invalid state")
+          root.statePayloadInvalid = false
+        }
+        return
+      }
       // Missing dependency, dead daemon, hyprsunset holding the outputs: the
       // CLI explains itself on stderr, so show that rather than a silent
       // widget. State stays "unknown" instead of showing an invented zero, and
@@ -962,12 +994,16 @@ Panel {
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { id: applyErr; waitForEnd: true }
     onExited: function(exitCode) {
+      var completedSchedulePhase = root.runningSchedulePhase
+      root.runningSchedulePhase = ""
       if (exitCode !== 0)
         root.publishError(Model.clampMessage(applyErr.text) || "omarchy-nightlight failed")
+      else if (completedSchedulePhase !== "")
+        root.publishPhase(completedSchedulePhase)
 
       var next = root.dequeue()
       if (next) {
-        root.run(next)
+        root.startApply(next)
         return
       }
       root.armWatchdog()
