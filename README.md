@@ -3,6 +3,10 @@
 Per-monitor night light for [Omarchy](https://omarchy.org): choose a different
 colour temperature and software brightness for every screen.
 
+Built for desks with more than one monitor: Omarchy's built-in night light
+applies one setting to every display. This plugin lets you warm one monitor
+while leaving another neutral.
+
 ## Install
 
 You need Omarchy 4 and [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs):
