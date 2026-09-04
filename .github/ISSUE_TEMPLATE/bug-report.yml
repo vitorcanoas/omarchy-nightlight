@@ -1,0 +1,62 @@
+name: Bug report
+description: Tell us about something that is not working as expected.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please remove any sensitive information from command output.
+
+  - type: input
+    id: omarchy-version
+    attributes:
+      label: Omarchy version
+      description: Include the Omarchy release or commit you are using.
+      placeholder: "e.g. Omarchy 4.x"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: "`omarchy-nightlight doctor` output"
+      description: Run `~/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight doctor` and paste its output here. If you ran `install.sh`, the shorter `omarchy-nightlight doctor` works too.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: output-name
+    attributes:
+      label: Monitor/output name
+      description: The affected output name, such as `DP-1` or `HDMI-A-1`.
+      placeholder: "e.g. DP-1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
