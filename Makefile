@@ -31,15 +31,21 @@ lint:
 	for path in $(QML_IMPORT_PATHS); do \
 		if [ -d "$$path" ]; then qml_import_args+=(-I "$$path"); fi; \
 	done; \
-	"$(QMLLINT)" "$${qml_import_args[@]}" \
-		-W 0 \
-		--import info \
-		--missing-property info \
-		--missing-type info \
-		--signal-handler-parameters info \
-		--unqualified info \
-		--unresolved-type info \
-		Panel.qml
+	if "$(QMLLINT)" --help 2>&1 | grep -q -- '--max-warnings'; then \
+		qml_import_args+=(--max-warnings 0 \
+			--import info \
+			--missing-property info \
+			--missing-type info \
+			--signal-handler-parameters info \
+			--unqualified info \
+			--unresolved-type info); \
+	else \
+		# Qt 6.4 has the older category names and fails on every warning. \
+		# Keep host-provided Quickshell diagnostics informational while still \
+		# failing on parser/compiler errors. \
+		qml_import_args+=(--import info --property info --signal info --type info --unqualified info); \
+	fi; \
+	"$(QMLLINT)" "$${qml_import_args[@]}" Panel.qml
 
 test: test-model test-cli
 
