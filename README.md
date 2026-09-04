@@ -1,265 +1,211 @@
 # Omarchy Night Light
 
-**Per-monitor colour temperature.** A separate blue-light filter, with its own
-intensity, for every screen — as an Omarchy bar widget: one minimal glyph on the
-bar, and a panel with a switch and a 0–100% slider per screen.
+Per-monitor colour temperature for Omarchy. Each screen gets its own blue-light
+filter, intensity, software brightness, pause timer and schedule through one
+bar widget.
 
-## Why
+## What it does
 
-Every other night-light option for Omarchy — the built-in one included — drives
-`hyprsunset` or `sunsetr`, and both apply a single temperature to **all** video
-outputs at once. There is no way to say "warm on the monitor I read on, neutral
-on the one I keep for dark-mode terminals".
+`wl-gammarelay-rs` exposes a DBus object per output. This plugin uses those
+objects to warm one monitor while leaving another neutral, and stores the
+chosen percentage for each screen across sessions.
 
-That is the gap this fills. `wl-gammarelay-rs` exposes a DBus object *per
-output*, which is what makes per-monitor temperature possible at all. This
-plugin drives it, remembers your choice for each screen across reboots, and puts
-the whole thing behind one bar icon.
+The intensity scale follows Windows Night light:
+
+```
+Kelvin = 6500 - (53 x percent)      0% = 6500K neutral, 100% = 1200K deep amber
+```
 
 <img alt="Night Light in the Omarchy bar" src="preview.png" />
 
 <img width="300" alt="The Night Light panel, one row per screen" src="panel.png" />
 <img width="300" alt="The drawer, with per-screen brightness, pause and schedule" src="drawer.png" />
 
-The intensity scale matches the Windows "Night light" slider, so the numbers
-mean what you expect:
-
-```
-Kelvin = 6500 - (53 x percent)      0% = 6500K neutral,  100% = 1200K deep amber
-```
-
 ## Requirements
 
 - Omarchy 4 with its Quickshell desktop (`omarchy-shell`)
 - [`wl-gammarelay-rs`](https://github.com/MaxVerevkin/wl-gammarelay-rs)
 
-`wl-gammarelay-rs` is **not** part of Omarchy and is not pulled in by installing
-this plugin. Install it yourself from the AUR:
+`wl-gammarelay-rs` is not part of Omarchy and is not installed by this plugin:
 
 ```bash
 yay -S wl-gammarelay-rs
 ```
 
-> **This plugin and Omarchy's built-in night light cannot both work.**
-> Omarchy's own `omarchy toggle nightlight` (the menu entry, and the
-> `omarchy-toggle-nightlight` command) drives `hyprsunset`. `hyprsunset` and
-> `wl-gammarelay-rs` both claim the Wayland `wlr-gamma-control` protocol, which
-> allows a single client per output, so whichever lost the race silently does
-> nothing — **in both directions**:
->
-> - Press Omarchy's toggle while this plugin's daemon holds the outputs, and
->   Omarchy's night light appears to do nothing.
-> - Start this plugin's daemon while `hyprsunset` is up, and this plugin appears
->   to do nothing. The panel says so rather than staying silent.
->
-> On a stock Omarchy 4, `hyprsunset` is not autostarted — it is started on
-> demand, so `pkill hyprsunset` clears the conflict only until the next thing
-> starts it again. Four things do: the `SUPER + CTRL + N` default binding, the
-> menu's night-light toggle, **Setup → Hyprsunset**, and the commented
-> `o.launch_on_start("hyprsunset")` in `~/.config/hypr/hyprsunset.conf` if you
-> ever uncommented it.
->
-> **Pick one and stay with it:** if you use this plugin, leave Omarchy's night
-> light alone, and unbind its key (see [Keybindings](#keybindings)).
+### Do not run two night-light providers
+
+Omarchy's built-in night light uses `hyprsunset`; this plugin uses
+`wl-gammarelay-rs`. Both claim the Wayland `wlr-gamma-control` protocol, so
+only one can control a given output. Choose one provider and keep the other
+stopped. If you switch from Omarchy's night light, stop `hyprsunset` and unbind
+its default key as described in [Keybindings](#keybindings).
 
 ## Install
+
+Add and enable the plugin through Omarchy:
 
 ```bash
 omarchy plugin add https://github.com/vitorcanoas/omarchy-nightlight.git --enable
 ```
 
-That is all the bar widget needs — it calls the CLI inside the plugin folder by
-absolute path, so nothing has to be on your `PATH`.
+This is sufficient for the bar widget. It calls the CLI inside the plugin by
+absolute path, so the CLI does not need to be on `PATH`.
 
-**Installing it does not change your screens.** The widget reads with
-`--no-start`, so simply enabling it never launches `wl-gammarelay-rs` and never
-takes the Wayland gamma control away from whatever already holds it. The daemon
-starts the first time you actually ask for something — a switch, a slider, a
-keybinding. Until then the panel just tells you it is not running.
+Enabling the plugin does not change the displays. The widget reads state with
+`--no-start`; the daemon starts only when an action needs it, such as a switch,
+slider, schedule or keybinding.
 
-If you also want the command in a terminal or bound to a key, run the optional
-installer once. It symlinks the CLI into `~/.local/bin` and checks the
-dependency:
+### Optional CLI installer
+
+`install.sh` is optional. Run it only if you want to call
+`omarchy-nightlight` from a terminal or from integrations that require a
+command on `PATH`:
 
 ```bash
 ~/.config/omarchy/plugins/vitorcanoas.nightlight/install.sh
 ```
+
+The script checks `wl-gammarelay-rs` and creates a symlink in
+`${XDG_BIN_HOME:-$HOME/.local/bin}`. It does not start the daemon, change a
+display, install the plugin or modify Omarchy configuration. The bar widget
+and the absolute-path examples below do not require this script.
 
 ## Using the bar widget
 
 | Gesture | What it does |
 |---|---|
 | left click | open the panel |
-| right click | turn the filter on everywhere (a screen saved at `0` is
-  left alone; one with nothing saved yet lights up at 40%), or off everywhere |
-| scroll | raise/lower every screen by 5 points |
+| right click | turn the filter on or off for all eligible screens |
+| scroll | raise or lower every eligible screen by 5 points |
 
-In the panel, each screen gets its own row: a switch to turn that screen's
-filter on or off, and a slider for its intensity. Dragging a slider changes the
-colour live and saves once you let go, so a drag never floods the machine with
-processes or records the values you merely passed through.
+A screen whose saved percentage is `0` is deliberately left neutral by global
+actions. A screen without a saved value uses 40% when turned on globally.
 
-The `⋯` button beside the master switch opens a drawer with per-screen
-brightness, pause, and the schedule. It closes again every time you open the
-panel, so the default view stays the list of screens.
+The panel has one row per screen. Each row has a switch and an intensity slider.
+Dragging changes the colour live and saves once the drag ends. The `...` button
+opens a drawer with software brightness, pause and schedule controls.
 
-Keyboard: `j`/`k` move between rows, `h`/`l` change the value of the row you are
-on, `Space`/`Enter` flip a switch, `Esc` closes. The drawer's own controls are
-mouse-driven.
+Keyboard controls in the panel are `j`/`k` to move between rows, `h`/`l` to
+change the current value, `Space`/`Enter` to flip a switch and `Esc` to close.
 
 ## Brightness
 
-Each screen also gets a **software brightness** slider, in the panel's drawer
-(the `⋯` button next to the master switch).
-
-This is not a repackaging of Omarchy's own brightness control, and it is worth
-knowing why both exist:
-
-|  | Omarchy's `omarchy-brightness-display` | this plugin |
-|---|---|---|
-| How | the monitor's own backlight, over DDC/CI | the compositor's gamma ramp |
-| Works on | monitors that answer DDC — many desktop monitors do not | every output, always |
-| Real light output | yes, genuinely dimmer backlight | no, the image is scaled darker |
-
-So use Omarchy's when your monitor supports it: dimming the actual backlight is
-better for your eyes and for power. Use this one for the screen that ignores
-DDC entirely, which is the common case for a second monitor — dimming one panel
-at night without touching the other is the whole reason it is here.
-
-The floor is 10%. `wl-gammarelay-rs` allows lower, but a screen at 2% is
-unreadable and the only way back would be the CLI.
+The drawer's software brightness slider scales the compositor's gamma ramp; it
+does not dim the monitor's physical backlight. Omarchy's
+`omarchy-brightness-display` is preferable when a monitor supports DDC/CI, while
+this control works on every output and can dim only the selected screen. The
+minimum is 10%.
 
 ## Using the CLI
 
-```bash
-omarchy-nightlight                 # show the state of every output
-omarchy-nightlight 40              # 40% on every output
-omarchy-nightlight DP-2 40         # 40% on DP-2 only
-omarchy-nightlight DP-2 +5         # raise DP-2 by 5 points
-omarchy-nightlight -5              # lower every output by 5 points
-omarchy-nightlight off             # everything neutral
-omarchy-nightlight DP-2 off        # only DP-2 neutral
-omarchy-nightlight on              # restore the saved percentages
-omarchy-nightlight toggle          # off if anything is on, else on
-omarchy-nightlight reset           # neutral white and full brightness, everywhere
-omarchy-nightlight restore         # re-apply the saved file (use at login)
-omarchy-nightlight --json          # machine-readable state
+The optional installer is not required when using the plugin path directly:
 
-omarchy-nightlight brightness 80        # software brightness, every screen
-omarchy-nightlight DP-2 brightness 80   # software brightness on DP-2 only
+```bash
+CLI="$HOME/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight"
+
+"$CLI"                         # show every output
+"$CLI" 40                      # 40% on every eligible output
+"$CLI" DP-2 40                 # 40% on DP-2 only
+"$CLI" DP-2 +5                 # raise DP-2 by 5 points
+"$CLI" -5                      # lower every eligible output by 5 points
+"$CLI" off                     # make every output neutral
+"$CLI" DP-2 off                # make only DP-2 neutral
+"$CLI" on                      # restore saved percentages
+"$CLI" toggle                  # off if anything is on, otherwise on
+"$CLI" reset                   # neutral white and full brightness everywhere
+"$CLI" restore                 # re-apply saved values at login
+"$CLI" --json                  # machine-readable state
+"$CLI" status                  # read state without starting the daemon
+"$CLI" doctor --json           # read-only installation diagnostics
+"$CLI" version                 # print the plugin version
+
+"$CLI" brightness 80           # software brightness on every output
+"$CLI" DP-2 brightness 80      # software brightness on DP-2
 ```
 
-Add `--no-save` to any of these to apply it without recording it — that is what
-the panel uses while a slider is being dragged.
+Add `--no-save` to apply a change without recording it. The panel uses this
+while a slider is being dragged. Use `--no-start` for read-only integrations
+that must never launch the daemon, for example:
 
-Output names are the ones `hyprctl monitors` prints (`DP-2`, `HDMI-A-1`, …).
+```bash
+"$CLI" --json --no-start
+```
+
+`status`, `doctor` and `version` are read-only by design and never start the
+daemon. `doctor --json` returns a non-zero status when a required dependency or
+runtime check needs attention.
+
+Output names are the ones printed by `hyprctl monitors` (`DP-2`, `HDMI-A-1`,
+and so on). Global commands skip outputs saved at `0`; name an output
+explicitly when you want to change that choice.
 
 ### Keybindings
 
-Omarchy 4 configures Hyprland in Lua. Add to `~/.config/hypr/bindings.lua`:
+Omarchy 4 configures Hyprland in Lua. This version uses the plugin path and
+therefore does not depend on the optional installer:
 
 ```lua
--- SUPER + CTRL + N is an Omarchy default, bound to `omarchy-toggle-nightlight`
--- (hyprsunset). Leave it in place and both fire: hyprsunset starts, claims the
--- gamma control, and this plugin silently stops working for the session. Unbind
--- it first -- that is Omarchy's documented way to replace a default.
+local nightlight = os.getenv("HOME") .. "/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight"
+
+-- SUPER + CTRL + N is an Omarchy default for hyprsunset.
 hl.unbind("SUPER + CTRL + N")
 
-o.bind("SUPER + CTRL + MINUS", "Night light down", "omarchy-nightlight -5")
-o.bind("SUPER + CTRL + EQUAL", "Night light up", "omarchy-nightlight +5")
-o.bind("SUPER + CTRL + N", "Night light", "omarchy-nightlight toggle")
+o.bind("SUPER + CTRL + MINUS", "Night light down", nightlight .. " -5")
+o.bind("SUPER + CTRL + EQUAL", "Night light up", nightlight .. " +5")
+o.bind("SUPER + CTRL + N", "Night light", nightlight .. " toggle")
 ```
 
-`SUPER + CTRL + MINUS` and `SUPER + CTRL + EQUAL` are free on a stock Omarchy 4
-and need no unbind.
-
-These need the optional installer above, which puts `omarchy-nightlight` on your
-`PATH`. Without it, use the full path to the CLI inside the plugin folder.
+If you ran `install.sh`, the commands can instead use the short
+`omarchy-nightlight` name. Check your current bindings before choosing keys.
 
 ### At login
 
-The daemon starts on demand, but the saved temperatures need re-applying once
-per session. Add this to `~/.config/hypr/autostart.lua`:
+The daemon starts on demand, but saved temperatures need to be re-applied once
+per session. Use the absolute plugin path so this works with the standard
+Omarchy installation, where the optional installer has not been run:
 
 ```lua
-o.launch_on_start("omarchy-nightlight restore")
+local nightlight = os.getenv("HOME") .. "/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight"
+o.launch_on_start(nightlight .. " restore")
 ```
 
-`restore` only touches outputs that have a line in the config file, so the same
-autostart is safe to version across machines that never configured night light.
+`restore` only touches outputs with a saved line in the config file, so this is
+safe to keep in a configuration shared across machines.
 
 ## Pause and schedule
 
-Both live in the drawer behind the `⋯` button, so the panel you see when you
-click the bar icon stays the list of screens and nothing else.
+**Pause** turns the filter off for 15, 30 or 60 minutes and restores each
+screen's own intensity automatically. **Schedule** turns the filter on and off
+at two clock times; it does not calculate sunset and does not use the network.
+Both controls are QML timers inside the plugin, so removing the plugin leaves
+no systemd timer or cron job behind.
 
-**Pause** turns the filter off for 15, 30 or 60 minutes and brings it back by
-itself — for editing photos or video, where a warm screen lies to you about
-colour. Each screen returns to its own intensity, because pausing goes through
-`off`/`on`, which never rewrite what you saved.
-
-**Schedule** is off by default and turns the filter on and off at two times you
-type. It schedules *on and off*, not an intensity, so every screen keeps its own
-percentage and a screen set to 0% stays neutral. It is clock-only: no location,
-no sunset calculation, no network.
-
-The countdown and the schedule are plain QML timers inside the plugin. They are
-deliberately not systemd timers or cron entries: Omarchy runs nothing when a
-plugin is removed, so anything registered outside this folder would outlive the
-uninstall forever.
-
-<details>
-<summary>Forcing one shared intensity at night</summary>
-
-Set `nightPercent` on the plugin's entry in `shell.json` to a number above 0 and
-the schedule will apply that percentage to every screen instead of restoring
-each screen's own. It has no UI because a single global intensity is the
-opposite of what most people install this for.
-
-</details>
+By default, scheduled night mode restores each screen's saved percentage. To
+use one shared percentage, set `nightPercent` on the plugin's entry in
+`~/.config/omarchy/shell.json` to a value above `0`. The schedule then applies
+that value to outputs whose saved percentage is above `0`; outputs saved at
+`0%` remain neutral because global commands intentionally skip them. Set
+`nightPercent` to `0` to restore each screen's own saved percentage.
 
 ## Configuration
 
-`~/.config/omarchy/nightlight.conf`, one `output=percent` line per screen, plus an
-`output.brightness=percent` line for any screen you dimmed:
+The backend state is stored in `~/.config/omarchy/nightlight.conf`:
 
-```
+```text
 DP-2=40
 HDMI-A-1=0
+HDMI-A-1.brightness=70
 ```
 
-It stores the percentage you **chose**, not what is currently on screen — which
-is why `off` erases nothing and `on` can bring everything back.
-
-<details>
-<summary>Why a file instead of inline settings in <code>shell.json</code></summary>
-
-Omarchy's rule is that plugin settings live inline on the bar entry in
-`shell.json`, and this plugin follows it for everything that is a setting. All
-of them are read with `setting()` from that entry: `command`, `nightPercent`,
-`scheduleEnabled`, `scheduleOnAt`, `scheduleOffAt` and `pausedUntil` — the last
-four written back by the panel itself.
-
-The saved percentages are not a setting, they are backend state, and they have
-to survive the shell being down. `omarchy-nightlight restore` runs at login
-before the bar exists, and a keybinding or an SSH session has to reach the same
-values without Quickshell running at all. A file both sides can read is the only
-thing that satisfies that; parsing `shell.json` from bash would make the CLI
-depend on the very component it has to work without.
-
-</details>
-
-**A screen saved at `0` is deliberately neutral.** Global commands
-(`omarchy-nightlight on`, `+5`, the scroll gesture, the master switch) skip it,
-so a portrait monitor you keep clean stays clean. Naming the output explicitly
-(`omarchy-nightlight HDMI-A-1 30`, or its slider in the panel) still works —
-that is how you change your mind.
+The file stores the percentages chosen by the user, not merely the current
+screen state. This is why `off` does not erase saved values and `on` can
+restore them. UI settings such as `command`, `nightPercent`, schedule values
+and pause state remain inline on the plugin entry in `shell.json`.
 
 ## Optional: an entry in the Omarchy menu
 
-Omarchy only reads menu extensions from *your* config, never from a plugin
-folder, so this is a manual paste — which also means it does not disappear when
-the plugin does. Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
+Menu extensions are user configuration. Add this block to
+`~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 
 ```jsonc
 "trigger.toggle.nightlight": {
@@ -270,96 +216,50 @@ the plugin does. Add to `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 }
 ```
 
-`--no-start` is not optional here. Omarchy evaluates every `checked` expression
-each time the menu opens, not when the row is drawn — without the flag, pressing
-`SUPER + SPACE` for anything at all would start `wl-gammarelay-rs` and take the
-gamma control.
-
-Needs `omarchy-nightlight` on your `PATH` (see the optional installer above) and
-`jq` for the `checked` expression. Remove the block by hand if you uninstall.
-
-## Licensing
-
-This plugin is MIT. `wl-gammarelay-rs` is GPL-3.0-only, which does **not** reach
-this code: the two are separate processes talking over DBus, and IPC between
-separate programs is not linking. Nothing here is derived from its source.
+This example requires the optional installer and `jq`. If the installer is not
+used, replace both command occurrences with the absolute plugin path. Keep
+`--no-start` in the `checked` expression: menu checks run whenever the menu
+opens and must not start `wl-gammarelay-rs`.
 
 ## Uninstall
 
-**Put your screens back first.** Removing the plugin deletes the CLI along with
-it, and `wl-gammarelay-rs` keeps applying whatever ramp it was last given — a
-dimmed or warm screen with nothing left on disk to explain it or undo it.
+Reset the outputs before removing the plugin:
 
 ```bash
 ~/.config/omarchy/plugins/vitorcanoas.nightlight/bin/omarchy-nightlight reset
 omarchy plugin remove vitorcanoas.nightlight
 ```
 
-The full path matters: `install.sh` is optional, so on a default install
-`omarchy-nightlight` is not on your `PATH`.
-
-If you already removed the plugin and a screen is stuck, either of these fixes
-it — the ramp is only held while the daemon is alive:
+If the plugin is already removed and a screen is still warm or dim, run
+`pkill wl-gammarelay-rs` or log out. Remove optional user additions separately:
 
 ```bash
-pkill wl-gammarelay-rs
+rm -f "${XDG_BIN_HOME:-$HOME/.local/bin}/omarchy-nightlight"
+rm -f "$HOME/.config/omarchy/nightlight.conf"
 ```
 
-or just log out and back in — the ramp goes with the Wayland connection either
-way. Where `uwsm-app` is available the daemon is launched into the compositor's
-own systemd scope and dies with the session; on the fallback path it is a plain
-detached process, so logging out still clears the screens, but not because the
-process was in the session scope.
-
-`omarchy plugin remove` never runs anything from the plugin. It removes the
-folder — or, for a folder that is not a git clone, renames it to
-`.<id>.bak.<timestamp>` beside itself — and disables the widget in `shell.json`.
-Whatever you added by hand is still yours to remove:
-
-```bash
-rm -f ~/.local/bin/omarchy-nightlight        # only if you ran install.sh
-                                             # ($XDG_BIN_HOME instead, if set)
-rm -f ~/.config/omarchy/nightlight.conf      # your saved percentages
-```
-
-Two lock files live in `$XDG_RUNTIME_DIR` (`omarchy-nightlight.lock` and
-`omarchy-nightlight.daemon.lock`). They are empty, and the runtime directory is
-wiped at logout, so there is nothing to clean up — they are listed only so
-nothing found on the machine is unaccounted for. If you run the CLI over SSH
-with no `$XDG_RUNTIME_DIR` set, they fall back to `/tmp` under the same names
-and are yours to delete. On a machine with more than one human, that fallback
-name belongs to whoever ran the CLI first, and the second person's saves will
-quietly stop persisting until it is removed.
-
-Also check, if you set them up:
-
-- the `omarchy-nightlight restore` line in `~/.config/hypr/autostart.lua` —
-  left behind it points at a dead symlink and fails quietly at every login
-- any keybindings you added to `~/.config/hypr/bindings.lua`
-- the menu block in `~/.config/omarchy/extensions/omarchy-menu.jsonc`
-- the widget's entry in `~/.config/omarchy/shell.json`, including any
-  `scheduleEnabled` / `scheduleOnAt` / `scheduleOffAt` / `pausedUntil` settings
-  the panel saved onto it
+Also remove any autostart line, keybindings, menu block and `shell.json` entry
+you added manually. Runtime lock directories live in `XDG_RUNTIME_DIR` and
+normally disappear at logout. If that variable is unavailable, the CLI creates
+a private per-user directory under `/tmp`; it never uses a shared predictable
+lock file.
 
 ## Troubleshooting
 
-**The panel shows an error line.** That is the CLI's own stderr. The usual
-causes are `wl-gammarelay-rs` not being installed, or `hyprsunset` holding the
-outputs.
+**The panel shows an error.** Check that `wl-gammarelay-rs` is installed and
+that `hyprsunset` is not holding the output's gamma control.
 
-**A slider moves but the screen does not change.** Something else already owns
-gamma control for that output — almost always `hyprsunset`. `pkill hyprsunset`.
+**A slider moves but the screen does not change.** Stop the competing provider:
+`pkill hyprsunset`.
 
-**A screen is stuck dark or warm and the plugin is gone.** The daemon is still
-applying the last ramp it was given. `pkill wl-gammarelay-rs`, or log out — it
-dies with the session. If the plugin is still installed, `omarchy-nightlight
-reset` is the tidy way.
+**A screen is stuck dark or warm.** If the plugin is installed, run `reset`.
+Otherwise stop `wl-gammarelay-rs` or log out.
 
-**A screen is missing from the panel.** The list comes from
-`busctl --user tree rs.wl-gammarelay`, which only shows outputs the daemon has
-bound. Reconnect the monitor, or restart the daemon.
+**A screen is missing.** The panel lists outputs exposed by
+`busctl --user tree rs.wl-gammarelay`. Reconnect the monitor or restart the
+daemon.
 
-**The widget does not appear after installing.**
+**The widget does not appear.** Rescan and inspect the plugin:
 
 ```bash
 omarchy-shell shell rescanPlugins
@@ -369,24 +269,19 @@ omarchy plugin list --json | jq '.[] | select(.id == "vitorcanoas.nightlight")'
 ## Development
 
 ```bash
-make validate   # omarchy plugin validate, git diff --check, shell syntax checks
-make lint       # qmllint against the real qs.Ui / qs.Commons modules
-make dev        # rsync this tree into ~/.config/omarchy/plugins and rescan
+make validate   # plugin validation, diff check and shell syntax checks
+make lint       # qmllint against Omarchy's qs.Ui / qs.Commons modules
+make test       # Model.js and CLI smoke tests
+make dev        # sync this tree into the local plugin directory and rescan
 ```
 
-The shell reloads plugin QML on save, so `make dev` once and then just edit.
-
-`make lint` builds a temporary import root because `qmllint -I` needs a
-directory *containing* `qs`, not the shell directory itself. The remaining
-`unqualified` and `missing-property` warnings are the same ones Omarchy's own
-first-party panels produce — `bar` is typed `QtObject`, so its members are
-invisible to static analysis.
-
-A bar widget is instantiated **once per monitor**, so this plugin elects a
-single owner for the idle poll and publishes the result to its siblings; only
-that owner registers the IPC handler. Keep that in mind before adding anything
-that shells out.
+`make dev` once is enough for the shell to reload plugin QML on save. The
+temporary import root used by `make lint` is removed when the command finishes.
+The widget is instantiated once per monitor; one instance owns the idle poll
+and IPC handler while publishing state to its siblings.
 
 ## License
 
-MIT
+MIT. `wl-gammarelay-rs` is GPL-3.0-only, but it is a separate process that
+communicates with this plugin over DBus; this repository does not link to or
+derive code from it.
