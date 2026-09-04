@@ -56,7 +56,7 @@ if command -v readlink >/dev/null 2>&1; then
   resolved_script=$(readlink -f -- "$SCRIPT_PATH" 2>/dev/null) || resolved_script=""
   [[ -n $resolved_script ]] && SCRIPT_PATH=$resolved_script
 fi
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
 MANIFEST="$SCRIPT_DIR/../manifest.json"
 
 # Locks are resolved lazily. This lets all read-only commands, including
@@ -386,6 +386,7 @@ brightness_in_file() {
   [[ -n $b ]] && echo "$b"
 }
 
+# shellcheck disable=SC2317 # called by dynamically selected CLI operations
 saved_brightness() {
   brightness_in_file "$1" || echo 100
 }
@@ -413,6 +414,7 @@ save_key() {
   # (see Panel.qml), but a keybinding has nothing and simply hangs. Five seconds
   # is far longer than an honest write takes, and it ends.
   ( acquire_lock "$LOCK" || exit 1
+    # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
     cleanup_write_lock() {
       rm -f "$CONF.tmp.$$"
       release_lock "$LOCK"
