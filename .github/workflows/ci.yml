@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Validate, lint, test and shellcheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install quality dependencies
+        env:
+          OMARCHY_CHECKOUT: ${{ runner.temp }}/omarchy
+          OMARCHY_REF: v4.0.2
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            jq \
+            qml6-module-qtqml \
+            qml6-module-qtquick \
+            qml6-module-qtquick-controls \
+            qml6-module-qtquick-layouts \
+            qt6-declarative-dev-tools \
+            shellcheck
+          git clone --depth 1 --branch "$OMARCHY_REF" https://github.com/basecamp/omarchy.git "$OMARCHY_CHECKOUT"
+          echo "$OMARCHY_CHECKOUT/bin" >> "$GITHUB_PATH"
+
+      - name: Validate plugin
+        env:
+          OMARCHY_PATH: ${{ runner.temp }}/omarchy
+        run: make validate
+
+      - name: Run qmllint gate
+        env:
+          OMARCHY_PATH: ${{ runner.temp }}/omarchy
+        run: make lint
+
+      - name: Run automated tests
+        run: make test
+
+      - name: Run ShellCheck
+        run: make shellcheck

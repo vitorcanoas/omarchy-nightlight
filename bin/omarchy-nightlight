@@ -20,7 +20,10 @@
 #   omarchy-nightlight toggle          off if anything is on, else on
 #   omarchy-nightlight reset           neutral white and full brightness, everywhere
 #   omarchy-nightlight restore         re-apply the saved file (use at login)
+#   omarchy-nightlight status          read the current state without starting anything
 #   omarchy-nightlight --json          machine-readable state, for the bar widget
+#   omarchy-nightlight doctor [--json] diagnose the local installation, read-only
+#   omarchy-nightlight version [--json] print the version from manifest.json
 #
 # Why not hyprsunset: it applies one temperature to ALL video outputs at once,
 # with no way to pick a monitor. wl-gammarelay-rs is the one that exposes a
@@ -46,11 +49,29 @@ NO_START=0
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/nightlight.conf"
 
-# The write lock lives in the runtime directory, not beside the config: it is
-# session state, it is cleaned up at logout on its own, and it keeps an empty
-# lock file out of the user's config folder where it would look like ours to
-# keep and theirs to wonder about.
-LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-nightlight.lock"
+# Resolve the real plugin directory so `version` also works when the optional
+# installer exposed this script through a symlink in ~/.local/bin.
+SCRIPT_PATH=${BASH_SOURCE[0]}
+if command -v readlink >/dev/null 2>&1; then
+  resolved_script=$(readlink -f -- "$SCRIPT_PATH" 2>/dev/null) || resolved_script=""
+  [[ -n $resolved_script ]] && SCRIPT_PATH=$resolved_script
+fi
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)
+MANIFEST="$SCRIPT_DIR/../manifest.json"
+
+# Locks are resolved lazily. This lets all read-only commands, including
+# `doctor`, remain read-only. The lock paths are directories created with mkdir,
+# so the final path is never opened through a symlink before serialization.
+RUNTIME_DIR=""
+LOCK=""
+DAEMON_LOCK=""
+
+# The temp file is named from our PID, so this reaches it from anywhere. A
+# RETURN trap inside the writing function was not enough: RETURN fires on a
+# function returning, and the widget does not wait for that -- its watchdog
+# SIGTERMs this process outright, which is exactly the case that used to strand
+# `nightlight.conf.tmp.<pid>` in the user's config folder forever.
+trap 'rm -f "$CONF.tmp.$$"' EXIT INT TERM
 SERVICE="rs.wl-gammarelay"
 IFACE="rs.wl.gammarelay"
 NEUTRAL=6500       # 0% on the Windows scale
@@ -64,10 +85,106 @@ ON_BELOW=6000
 die() { printf 'omarchy-nightlight: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'omarchy-nightlight: %s\n' "$*" >&2; }
 
+json_escape() {
+  local value=${1-}
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+manifest_version() {
+  [[ -r $MANIFEST ]] || return 1
+  sed -nE 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$MANIFEST" | head -n1
+}
+
+runtime_dir_is_private() {
+  local dir=${1-} mode
+  [[ -n $dir && -d $dir && ! -L $dir && -O $dir ]] || return 1
+  mode=$(stat -c '%a' -- "$dir" 2>/dev/null) || return 1
+  [[ $mode == 700 ]]
+}
+
+# XDG_RUNTIME_DIR is required to be a private directory. When it is absent,
+# preserve the CLI's usability with a per-user directory under /tmp. The
+# directory is created atomically with mode 0700 and is rejected if another
+# user already controls the name. We never fall back to a global lock file.
+prepare_runtime_dir() {
+  local candidate tmp_mode
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    runtime_dir_is_private "$XDG_RUNTIME_DIR" || return 1
+    RUNTIME_DIR=$XDG_RUNTIME_DIR
+  else
+    candidate="/tmp/omarchy-nightlight-${EUID}"
+    [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]] || return 1
+    tmp_mode=$(stat -c '%a' -- /tmp 2>/dev/null) || return 1
+    (( 8#$tmp_mode & 01000 )) || return 1
+    [[ ! -L $candidate ]] || return 1
+    if [[ ! -e $candidate ]]; then
+      ( umask 077; mkdir -- "$candidate" ) 2>/dev/null || return 1
+    fi
+    runtime_dir_is_private "$candidate" || return 1
+    RUNTIME_DIR=$candidate
+  fi
+  LOCK="$RUNTIME_DIR/omarchy-nightlight.lock.d"
+  DAEMON_LOCK="$RUNTIME_DIR/omarchy-nightlight.daemon.lock.d"
+}
+
+# Directory locks avoid the vulnerable `9>path` shell redirection: mkdir does
+# not follow a symlink at the final component. A small owner file permits
+# recovery after SIGKILL without weakening the atomic acquisition step.
+acquire_lock() {
+  local path=$1 deadline=$((SECONDS + 5)) owner
+  while :; do
+    [[ ! -L $path && ( ! -e $path || -d $path ) ]] || return 1
+    if ( umask 077; mkdir -- "$path" ) 2>/dev/null; then
+      if printf '%s\n' "$$" >"$path/pid" 2>/dev/null; then
+        return 0
+      fi
+      rm -f -- "$path/pid" 2>/dev/null || true
+      rmdir -- "$path" 2>/dev/null || true
+      return 1
+    fi
+
+    [[ ! -L $path && -d $path ]] || return 1
+    owner=$(cat -- "$path/pid" 2>/dev/null || true)
+    if [[ $owner =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f -- "$path/pid" 2>/dev/null || true
+      rmdir -- "$path" 2>/dev/null || true
+      continue
+    fi
+    if [[ ! $owner =~ ^[0-9]+$ ]]; then
+      # A SIGKILL between mkdir and writing pid leaves an otherwise valid
+      # private lock directory with no owner metadata. Do not remove a lock
+      # that may have been created moments ago; after the normal acquisition
+      # timeout it is safe to recover this incomplete stale lock.
+      local created now
+      created=$(stat -c '%Y' -- "$path" 2>/dev/null || echo 0)
+      now=$(date +%s 2>/dev/null || echo 0)
+      if [[ $created =~ ^[0-9]+$ && $now =~ ^[0-9]+$ ]] && (( now - created >= 5 )); then
+        rmdir -- "$path" 2>/dev/null || true
+        continue
+      fi
+    fi
+    (( SECONDS >= deadline )) && return 1
+    LC_ALL=C sleep 0.05 || return 1
+  done
+}
+
+release_lock() {
+  local path=${1-}
+  [[ -n $path && ! -L $path && -d $path ]] || return 0
+  rm -f -- "$path/pid" 2>/dev/null || true
+  rmdir -- "$path" 2>/dev/null || true
+}
+
 # Set whenever a write did not land. The command still prints what it can, but
 # it must not claim success: a script that trusts the exit code has to be able
 # to tell "applied" from "the daemon ignored me".
 FAILED=0
+LOCK_FAILURE=0
 
 # The scale is linear in Kelvin, deliberately. The eye perceives colour
 # temperature closer to linearly in mireds (a million over Kelvin), so the warm
@@ -96,11 +213,50 @@ ensure_daemon() {
 
   command -v wl-gammarelay-rs >/dev/null 2>&1 || return 1
 
-  # A daemon that is already running but has not claimed the bus name is not
-  # going to be helped by starting another one -- it is being blocked, almost
-  # always by hyprsunset holding the outputs. Launching a second copy every time
-  # anyone runs this command would pile up processes for the whole session.
-  pgrep -x wl-gammarelay-rs >/dev/null 2>&1 && return 1
+  prepare_runtime_dir || { LOCK_FAILURE=1; return 1; }
+
+  # Serialise from here down. The pgrep below is a check-then-act, and the
+  # window is not sub-millisecond: uwsm-app is a shell client that hands the
+  # launch to a session daemon over FIFOs, so for the whole round trip no
+  # process named wl-gammarelay-rs exists for pgrep to find. Two invocations
+  # landing together -- an autostart `restore` and the user's first keybinding
+  # -- both passed the check and both asked for a daemon, and the loser could
+  # claim neither the bus name nor the gamma control.
+  # Do not continue without this lock. Starting two gamma daemons concurrently
+  # can make either one lose the bus name or the output gamma control.
+  acquire_lock "$DAEMON_LOCK" || { LOCK_FAILURE=1; return 1; }
+
+  # Whoever we queued behind may have started it while we waited.
+  if busctl --user status "$SERVICE" >/dev/null 2>&1; then
+    release_lock "$DAEMON_LOCK"
+    return 0
+  fi
+
+  # `wl-gammarelay-rs?` with the trailing s optional, because the name is 16
+  # characters and the kernel truncates comm to 15: `pgrep -x wl-gammarelay-rs`
+  # matches NOTHING, ever. Every guard built on it was dead code -- this branch
+  # never ran, so a second daemon was spawned on top of a blocked one, and
+  # daemon_problem could never reach the message it has for that case.
+  # A running daemon that has not claimed the bus name may be blocked -- almost
+  # always hyprsunset holding the outputs -- or may simply be 80ms old. This
+  # used to return 1 immediately, so a second keypress during startup died with
+  # "something else may hold the gamma control" on a machine where nothing was
+  # wrong. Telling the two apart costs one bounded wait.
+  local rc
+  if pgrep -x 'wl-gammarelay-rs?' >/dev/null 2>&1; then
+    # Only wait when the cause could be youth. A daemon blocked by hyprsunset is
+    # not going to claim the bus in four seconds or in four hours, and paying
+    # that wait on every keypress of a permanently conflicted machine helps
+    # nobody -- daemon_problem already names hyprsunset in that case.
+    if pgrep -x hyprsunset >/dev/null 2>&1; then
+      rc=1
+    else
+      wait_for_bus
+      rc=$?
+    fi
+    release_lock "$DAEMON_LOCK"
+    return $rc
+  fi
 
   # Prefer uwsm-app so the daemon lands in the compositor's own systemd scope
   # and dies with the session; fall back to a bare setsid where uwsm is absent.
@@ -110,25 +266,40 @@ ensure_daemon() {
     setsid wl-gammarelay-rs >/dev/null 2>&1 &
   fi
 
-  # Backoff rather than 25 flat polls: a daemon that is going to come up does so
-  # in well under a second, and one that is not should not cost three more
-  # seconds of a blocked terminal on every single call.
-  local wait=0.1
+  wait_for_bus
+  rc=$?
+  release_lock "$DAEMON_LOCK"
+  return $rc
+}
+
+# Bounded backoff waiting for the bus name: a daemon that is going to come up
+# does so in well under a second, and one that is not should not cost three more
+# seconds of a blocked terminal on every call. Six steps, ~4.1s total.
+#
+# Milliseconds as integers, not an awk float. awk's `print` formats according to
+# LC_NUMERIC, so under a comma-decimal locale the delay came out as "0,18",
+# `sleep` rejected it, and -- with no `set -e` and the status discarded -- the
+# loop spun through all six iterations with no delay at all, reporting that a
+# daemon which needed 300ms "would not start".
+wait_for_bus() {
+  local ms=100
   for _ in {1..6}; do
-    sleep "$wait"
+    LC_ALL=C sleep "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))" || return 1
     busctl --user status "$SERVICE" >/dev/null 2>&1 && return 0
-    wait=$(awk "BEGIN{print $wait * 1.8}")
+    ms=$(( ms * 18 / 10 ))
   done
   return 1
 }
 
 # One line, no quotes and no newlines: it goes into the JSON the widget reads.
 daemon_problem() {
-  if ! command -v wl-gammarelay-rs >/dev/null 2>&1; then
+  if (( LOCK_FAILURE )); then
+    printf 'could not acquire the private runtime lock; refusing to continue without serialization.'
+  elif ! command -v wl-gammarelay-rs >/dev/null 2>&1; then
     printf 'wl-gammarelay-rs is not installed. Install it with: yay -S wl-gammarelay-rs'
   elif pgrep -x hyprsunset >/dev/null 2>&1; then
     printf 'hyprsunset is holding the Wayland gamma control, so wl-gammarelay-rs cannot start. Stop it: pkill hyprsunset'
-  elif pgrep -x wl-gammarelay-rs >/dev/null 2>&1; then
+  elif pgrep -x 'wl-gammarelay-rs?' >/dev/null 2>&1; then
     printf 'wl-gammarelay-rs is running but has not claimed its bus name. Something else may hold the gamma control.'
   elif (( NO_START )); then
     printf 'wl-gammarelay-rs is not running.'
@@ -210,6 +381,7 @@ brightness_in_file() {
   [[ -n $b ]] && echo "$b"
 }
 
+# shellcheck disable=SC2317 # called by dynamically selected CLI operations
 saved_brightness() {
   brightness_in_file "$1" || echo 100
 }
@@ -223,17 +395,30 @@ saved_pct() {
 save_pct() { save_key "$1" "$2"; }
 save_brightness_pct() { save_key "$1.brightness" "$2"; }
 
-# Serialised with flock because the write is read-modify-write, and the two
-# writers here are genuinely concurrent: a `+5` keybinding can fire while a
-# slider is being released. Without the lock both read the old file and the
-# loser's key vanishes from it. The mv below is already atomic; this is what
-# makes the read-then-write around it atomic too.
+# Serialised with a private directory lock because the write is read-modify-
+# write, and the two writers here are genuinely concurrent: a `+5` keybinding
+# can fire while a slider is being released. Without the lock both read the old
+# file and the loser's key vanishes from it. The mv below is already atomic;
+# this is what makes the read-then-write around it atomic too.
 save_key() {
   local out=$1 pct=$2
   mkdir -p "$(dirname "$CONF")"
-  ( flock 9 || exit 1
+  prepare_runtime_dir || return 1
+  # acquire_lock has a bounded wait: a writer wedged while holding the lock
+  # must not block every later invocation forever. The widget has a 15s
+  # watchdog for that (see Panel.qml), but a keybinding has nothing and simply
+  # hangs. Five seconds is far longer than an honest write takes, and it ends.
+  ( acquire_lock "$LOCK" || exit 1
+    # shellcheck disable=SC2317 # invoked indirectly by the EXIT trap
+    cleanup_write_lock() {
+      rm -f "$CONF.tmp.$$"
+      release_lock "$LOCK"
+    }
+    trap cleanup_write_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     save_key_locked "$out" "$pct"
-  ) 9>"$LOCK"
+  )
 }
 
 save_key_locked() {
@@ -262,26 +447,83 @@ EOF
   # exit 0, "success" printed, every other screen's setting gone. `mv` only
   # needs write permission on the directory, so it had no trouble doing it.
   local tmp="$CONF.tmp.$$"
-  if grep -qE "^\s*$out\s*=" "$CONF" 2>/dev/null; then
-    sed -E "s|^(\s*$out\s*=\s*)[0-9]+|\1$pct|" "$CONF" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  else
-    { cat "$CONF" && printf '%s=%s\n' "$out" "$pct"; } >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  fi
+
+  # awk rather than sed, for three reasons the sed version got wrong:
+  #
+  #  - It rewrites the VALUE and keeps anything the user wrote after it. A
+  #    whole-line replace ate trailing comments, and the header above invites
+  #    hand-editing; worse, the size guard below then read that shrink as data
+  #    loss and refused every future save, permanently.
+  #  - It replaces the value whatever the value looks like. The old pair
+  #    disagreed with itself -- grep decided the key existed on `key\s*=`, sed
+  #    only rewrote a value matching `[0-9]+` -- so `DP-2=` or `DP-2=abc` made
+  #    sed copy the file verbatim and exit 0. save_key reported success having
+  #    written nothing, and the setting silently vanished at the next login.
+  #  - It appends through a record, so a config with no trailing newline gets
+  #    one instead of producing `DP-2=40DP-9=30`, which no reader could parse.
+  #
+  # Every matching line is rewritten, not just the first: leaving a stale
+  # duplicate behind would make the read-back below disagree with itself.
+  awk -v key="$out" -v val="$pct" '
+    BEGIN { pat = "^[ \t]*" key "[ \t]*=" ; found = 0 }
+    {
+      if ($0 ~ pat) {
+        found = 1
+        match($0, pat)
+        head = substr($0, 1, RLENGTH)
+        rest = substr($0, RLENGTH + 1)
+        hash = index(rest, "#")
+        if (hash > 0) print head val " " substr(rest, hash)
+        else print head val
+        next
+      }
+      print
+    }
+    END { if (!found) print key "=" val }
+  ' "$CONF" >"$tmp" 2>/dev/null || return 1
 
   # A temp file smaller than the original means content was lost on the way,
   # whatever the exit codes said. Refuse rather than promote it.
   local old_size new_size
-  old_size=$(wc -c <"$CONF" 2>/dev/null) || { rm -f "$tmp"; return 1; }
-  new_size=$(wc -c <"$tmp" 2>/dev/null) || { rm -f "$tmp"; return 1; }
+  old_size=$(wc -c <"$CONF" 2>/dev/null) || return 1
+  new_size=$(wc -c <"$tmp" 2>/dev/null) || return 1
   if (( new_size < old_size - 8 )); then
-    rm -f "$tmp"
     return 1
   fi
 
-  mv -f "$tmp" "$CONF" || { rm -f "$tmp"; return 1; }
+  # Read the value back out of the temp before promoting it. If what we are
+  # about to install does not say what we were asked to write, nothing else in
+  # here gets to call this a success.
+  #
+  # awk again, not `grep -oP`: the read path already degrades where grep is
+  # built without PCRE, and asserting with -P here would have turned that
+  # degradation into a hard failure of every save on such a machine.
+  local written
+  written=$(awk -v key="$out" '
+    BEGIN { pat = "^[ \t]*" key "[ \t]*=[ \t]*" ; v = "" }
+    $0 ~ pat { line = $0; sub(pat, "", line); sub(/[^0-9].*$/, "", line); v = line }
+    END { print v }
+  ' "$tmp" 2>/dev/null)
+  [[ $written == "$pct" ]] || return 1
+
+  mv -f "$tmp" "$CONF" || return 1
 }
 
 # ---------------------------------------------------------------------------
+# Neutralise one output and REPORT it if the write did not land. `off`,
+# `toggle`, `reset` and `restore` used to call set_kelvin bare and discard its
+# status, so with the daemon dead or an output unplugged they printed their OSD,
+# printed a state table built from reads that had failed too, and exited 0 with
+# the screen still amber. `reset` is the documented way to un-tint your screens
+# before deleting the plugin -- it lying is the worst version of this bug.
+go_neutral() {
+  set_kelvin "$1" "$NEUTRAL" || {
+    warn "could not neutralise $1"
+    FAILED=1
+    return 1
+  }
+}
+
 is_on() {
   local k; k=$(kelvin_of "$1")
   [[ -n $k ]] && (( k < ON_BELOW ))
@@ -336,7 +578,12 @@ apply_to() {
   # nothing on screen, all with exit 0. Only on a committing write: a drag
   # passes --no-save and skips the extra round trip.
   actual=$(kelvin_of "$out")
-  if [[ -n $actual && $actual != "$k" ]]; then
+  if [[ -z $actual ]]; then
+    warn "$out did not return a temperature after the write; leaving the saved value alone"
+    FAILED=1
+    return 1
+  fi
+  if [[ $actual != "$k" ]]; then
     warn "$out did not take the new temperature; leaving the saved value alone"
     FAILED=1
     return 1
@@ -430,6 +677,132 @@ osd() {
   omarchy osd -i brightness -p "$1" -m "$2" >/dev/null 2>&1
 }
 
+doctor_add_check() {
+  doctor_names+=("$1")
+  doctor_oks+=("$2")
+  doctor_details+=("$3")
+  (( $2 )) || doctor_failed=1
+}
+
+doctor() {
+  local format=0 dep path version missing="" runtime_candidate
+  local config_dir config_detail daemon_detail
+  local -a required=(busctl awk grep sed head pgrep sleep mkdir mv stat readlink rm rmdir cat wc dirname kill setsid date)
+  local -a doctor_names=() doctor_oks=() doctor_details=()
+  local doctor_failed=0
+  [[ ${1:-} == --json ]] && format=1
+
+  for dep in "${required[@]}"; do
+    command -v "$dep" >/dev/null 2>&1 || missing+=" $dep"
+  done
+  command -v wl-gammarelay-rs >/dev/null 2>&1 || missing+=" wl-gammarelay-rs"
+  if [[ -n $missing ]]; then
+    doctor_add_check dependencies 0 "missing:${missing}"
+  else
+    doctor_add_check dependencies 1 "required commands available"
+  fi
+
+  if [[ -x $SCRIPT_PATH ]]; then
+    version=$(manifest_version 2>/dev/null || true)
+    [[ -n $version ]] || version=unknown
+    doctor_add_check cli 1 "$SCRIPT_PATH (version $version)"
+  else
+    doctor_add_check cli 0 "CLI is not executable: $SCRIPT_PATH"
+  fi
+
+  if command -v busctl >/dev/null 2>&1 && busctl --user status "$SERVICE" >/dev/null 2>&1; then
+    daemon_detail="running"
+    doctor_add_check daemon 1 "$daemon_detail"
+  else
+    daemon_detail="not running (read-only check; no start attempted)"
+    doctor_add_check daemon 1 "$daemon_detail"
+  fi
+
+  config_dir=$(dirname -- "$CONF")
+  if [[ -f $CONF && -r $CONF && -O $CONF ]]; then
+    config_detail="readable user-owned config: $CONF"
+    doctor_add_check config 1 "$config_detail"
+  elif [[ ! -e $CONF && ! -L $CONF && -d $config_dir && -w $config_dir ]]; then
+    config_detail="not created yet; writable parent: $config_dir"
+    doctor_add_check config 1 "$config_detail"
+  else
+    config_detail="config is missing, unreadable, not user-owned, or parent is not writable: $CONF"
+    doctor_add_check config 0 "$config_detail"
+  fi
+
+  if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+    if runtime_dir_is_private "$XDG_RUNTIME_DIR"; then
+      doctor_add_check runtime 1 "private XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+    else
+      doctor_add_check runtime 0 "XDG_RUNTIME_DIR must be an existing user-owned directory with mode 0700"
+    fi
+  else
+    runtime_candidate="/tmp/omarchy-nightlight-${EUID}"
+    if [[ -L $runtime_candidate || ( -e $runtime_candidate && ! -d $runtime_candidate ) ]]; then
+      doctor_add_check runtime 0 "fallback path is controlled by another filesystem entry: $runtime_candidate"
+    elif [[ -e $runtime_candidate ]]; then
+      if runtime_dir_is_private "$runtime_candidate"; then
+        doctor_add_check runtime 1 "private per-user fallback: $runtime_candidate"
+      else
+        doctor_add_check runtime 0 "fallback exists but is not user-owned/private: $runtime_candidate"
+      fi
+    elif [[ -d /tmp && ! -L /tmp && -w /tmp && -k /tmp ]]; then
+      doctor_add_check runtime 1 "secure per-user fallback will be created: $runtime_candidate"
+    else
+      doctor_add_check runtime 0 "cannot create a private runtime fallback under /tmp"
+    fi
+  fi
+
+  if pgrep -x hyprsunset >/dev/null 2>&1; then
+    doctor_add_check gamma-conflict 0 "hyprsunset is running and may own gamma control"
+  else
+    doctor_add_check gamma-conflict 1 "hyprsunset not detected"
+  fi
+
+  if command -v omarchy >/dev/null 2>&1; then
+    path=$(command -v omarchy)
+    doctor_add_check omarchy 1 "$path"
+  else
+    doctor_add_check omarchy 1 "optional command not installed; OSD notifications will be skipped"
+  fi
+
+  if (( format )); then
+    printf '{"ok":%s,"checks":{' "$([[ $doctor_failed -eq 0 ]] && echo true || echo false)"
+    local i escaped_name escaped_detail
+    for i in "${!doctor_names[@]}"; do
+      (( i )) && printf ','
+      escaped_name=$(json_escape "${doctor_names[i]}")
+      escaped_detail=$(json_escape "${doctor_details[i]}")
+      printf '"%s":{"ok":%s,"detail":"%s"}' "$escaped_name" "$( (( doctor_oks[i] )) && echo true || echo false )" "$escaped_detail"
+    done
+    printf '}}\n'
+  else
+    printf 'omarchy-nightlight doctor: %s\n' "$([[ $doctor_failed -eq 0 ]] && echo ok || echo issues-found)"
+    for i in "${!doctor_names[@]}"; do
+      printf '%-16s %s - %s\n' "${doctor_names[i]}" "$( (( doctor_oks[i] )) && echo ok || echo fail )" "${doctor_details[i]}"
+    done
+  fi
+  return "$doctor_failed"
+}
+
+version_command() {
+  local version
+  version=$(manifest_version 2>/dev/null || true)
+  [[ -n $version ]] || {
+    if [[ ${1:-} == --json ]]; then
+      printf '{"version":null,"error":"manifest.json is unavailable"}\n'
+    else
+      die "manifest.json is unavailable; cannot determine the version"
+    fi
+    return 1
+  }
+  if [[ ${1:-} == --json ]]; then
+    printf '{"version":"%s"}\n' "$(json_escape "$version")"
+  else
+    printf 'omarchy-nightlight %s\n' "$version"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 show() {
   local o k b warning
@@ -486,12 +859,98 @@ case "${1:-}" in
   -h|--help|help) sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
+# These commands are deliberately dispatched before ensure_daemon. They only
+# inspect local files, the user bus, or the manifest, so running them must never
+# start wl-gammarelay-rs or claim Wayland gamma control.
+case "${1:-}" in
+  doctor)
+    [[ $# -le 2 && ( $# -eq 1 || ${2:-} == --json ) ]] || die "doctor accepts only the optional --json flag"
+    doctor "${2:-}"
+    exit $?
+    ;;
+  version)
+    [[ $# -le 2 && ( $# -eq 1 || ${2:-} == --json ) ]] || die "version accepts only the optional --json flag"
+    version_command "${2:-}"
+    exit $?
+    ;;
+esac
+
+case "${1:-}" in
+  --json)
+    [[ $# -eq 1 ]] || die "--json accepts no command arguments"
+    ;;
+  status)
+    [[ $# -eq 1 ]] || die "status accepts no arguments"
+    ;;
+esac
+
+# Reject malformed commands before any mutating command can start the daemon.
+# Output names are resolved only after the daemon is available, so the unknown
+# first word is treated as a possible output selector and its following verb is
+# still checked here.
+validate_pre_daemon_args() {
+  local first=${1:-} second=${2:-} third=${3:-}
+  case "$first" in
+    "")
+      [[ $# -eq 0 ]] || die "unexpected arguments"
+      ;;
+    --json|status)
+      [[ $# -eq 1 ]] || die "$first accepts no command arguments"
+      ;;
+    doctor|version)
+      die "$first accepts only its optional --json flag"
+      ;;
+    brightness)
+      [[ $# -eq 2 ]] || die "brightness requires exactly one percentage argument"
+      [[ $second =~ ^[0-9]+$ ]] || die "brightness takes a percentage from $BRIGHT_MIN to 100, got $second"
+      (( second >= BRIGHT_MIN && second <= 100 )) || die "brightness takes a percentage from $BRIGHT_MIN to 100, got $second"
+      ;;
+    on|off|toggle|reset|restore|+[0-9]*|-[0-9]*|[0-9]*)
+      [[ $# -eq 1 ]] || die "$first accepts no additional arguments"
+      if [[ $first == +* || $first == -* || $first == [0-9]* ]]; then
+        [[ $first =~ ^[+-]?[0-9]+$ ]] || die "invalid percentage: $first"
+      fi
+      ;;
+    *)
+      [[ $first != -* ]] || die "unknown command \"$first\". See 'omarchy-nightlight --help'"
+      case "$second" in
+        "")
+          [[ $# -eq 1 ]] || die "unexpected arguments after output \"$first\""
+          ;;
+        brightness)
+          [[ $# -eq 3 ]] || die "brightness requires exactly one percentage argument"
+          [[ $third =~ ^[0-9]+$ ]] || die "brightness takes a percentage from $BRIGHT_MIN to 100, got $third"
+          (( third >= BRIGHT_MIN && third <= 100 )) || die "brightness takes a percentage from $BRIGHT_MIN to 100, got $third"
+          ;;
+        on|off|toggle|reset|restore|+[0-9]*|-[0-9]*|[0-9]*)
+          [[ $# -eq 2 ]] || die "$second accepts no additional arguments"
+          if [[ $second == +* || $second == -* || $second == [0-9]* ]]; then
+            [[ $second =~ ^[+-]?[0-9]+$ ]] || die "invalid percentage: $second"
+          fi
+          ;;
+        *)
+          die "unknown command \"$second\". See 'omarchy-nightlight --help'"
+          ;;
+      esac
+      ;;
+  esac
+}
+
+validate_pre_daemon_args "$@"
+
 # A read must never be the thing that starts the daemon, and a machine without
-# it must still get an answer it can act on rather than a failure.
+# it must still get an answer it can act on rather than a failure. `status` is
+# an explicit alias for the historical no-argument read.
+case "${1:-}" in
+  ""|status|--json) NO_START=1 ;;
+esac
 if ! ensure_daemon; then
   case "${1:-}" in
     --json)
       printf '{"warning":"%s","daemon":false,"outputs":[]}\n' "$(daemon_problem)"
+      exit 0 ;;
+    status)
+      printf '%s\n' "$(daemon_problem)"
       exit 0 ;;
     "")
       printf '%s\n' "$(daemon_problem)"
@@ -519,6 +978,24 @@ else
   mapfile -t TARGETS < <(outputs)
   ACTION="${1:-}"; ARG="${2:-}"
 fi
+
+# Do not silently discard words after a valid command. A typo such as
+# `brightness 80 junk` must fail before touching a display, and the same rule
+# applies when an output name shifts the positional arguments by one.
+case "$ACTION" in
+  "")
+    [[ $# -eq $NAMED_OUTPUT ]] || die "${ACTION:-status} accepts no additional arguments"
+    ;;
+  status|--json)
+    [[ $NAMED_OUTPUT -eq 0 && $# -eq 1 ]] || die "$ACTION accepts no additional arguments"
+    ;;
+  on|off|toggle|reset|restore|+[0-9]*|-[0-9]*|[0-9]*)
+    [[ $# -eq $(( NAMED_OUTPUT + 1 )) ]] || die "$ACTION accepts no additional arguments"
+    ;;
+  brightness)
+    [[ $# -eq $(( NAMED_OUTPUT + 2 )) ]] || die "brightness requires exactly one percentage argument"
+    ;;
+esac
 
 # An output saved at 0% is deliberately neutral. A global command (no output
 # name) must not light it up: without this, a "+5 everywhere" keybinding would
@@ -557,6 +1034,8 @@ case "$ACTION" in
       show
     fi ;;
 
+  status) show ;;
+
   --json) json ;;
 
   restore)
@@ -566,14 +1045,17 @@ case "$ACTION" in
     # light nothing is applied and the autostart line stays harmless — that is
     # what lets you version one autostart across every machine.
     for o in "${TARGETS[@]}"; do
-      b=$(brightness_in_file "$o") && set_brightness "$b" "$o"
+      b=$(brightness_in_file "$o") && { set_brightness "$b" "$o" || { warn "could not set brightness on $o"; FAILED=1; }; }
       p=$(pct_in_file "$o") || continue
       # A screen written as 0 is meant to be neutral, so say so rather than
       # leaving whatever ramp happened to be loaded. At login that is already
       # true and this is a no-op; run by hand after an `on` it is the difference
       # between "restored the file" and "restored most of the file".
-      if (( p > 0 )); then set_kelvin "$o" "$(pct_to_kelvin "$p")"
-      else set_kelvin "$o" "$NEUTRAL"; fi
+      if (( p > 0 )); then
+        set_kelvin "$o" "$(pct_to_kelvin "$p")" || { warn "could not set the temperature on $o"; FAILED=1; }
+      else
+        go_neutral "$o"
+      fi
     done ;;
 
   on)
@@ -587,7 +1069,7 @@ case "$ACTION" in
     show ;;
 
   off)
-    for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
+    for o in "${TARGETS[@]}"; do go_neutral "$o"; done
     osd 0 "Night light off"
     show ;;
 
@@ -597,7 +1079,7 @@ case "$ACTION" in
     any=0
     for o in "${TARGETS[@]}"; do is_on "$o" && any=1; done
     if (( any )); then
-      for o in "${TARGETS[@]}"; do set_kelvin "$o" "$NEUTRAL"; done
+      for o in "${TARGETS[@]}"; do go_neutral "$o"; done
       osd 0 "Night light off"
     else
       osd_pct=""
@@ -617,8 +1099,8 @@ case "$ACTION" in
     # with the folder, and the daemon keeps applying the last ramp it was given.
     # Nothing is saved, so the chosen intensities survive for a later `on`.
     for o in "${TARGETS[@]}"; do
-      set_kelvin "$o" "$NEUTRAL"
-      set_brightness 100 "$o"
+      go_neutral "$o"
+      set_brightness 100 "$o" || { warn "could not restore brightness on $o"; FAILED=1; }
     done
     osd 0 "Night light reset"
     show ;;

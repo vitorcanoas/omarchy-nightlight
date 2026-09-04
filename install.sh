@@ -7,10 +7,14 @@
 # Run it only if you also want `omarchy-nightlight` on your PATH, for a terminal
 # or a Hyprland keybinding. It creates ONE symlink in ~/.local/bin.
 #
-# That symlink is the only thing this plugin ever puts outside its own folder,
-# and removing the plugin will NOT take it with them. Undo it by hand:
+# That symlink is the only thing THIS SCRIPT puts outside the plugin folder, and
+# removing the plugin will NOT take it with it. Undo it by hand:
 #
 #     rm -f ~/.local/bin/omarchy-nightlight
+#
+# The plugin itself also writes ~/.config/omarchy/nightlight.conf (your saved
+# percentages) and two short-lived private lock directories under
+# $XDG_RUNTIME_DIR. The README's Uninstall section lists all of it.
 
 set -euo pipefail
 
@@ -55,6 +59,29 @@ if [[ -e $LINK || -L $LINK ]]; then
     printf 'already linked: %s\n' "$LINK"
     exit 0
   fi
+
+  # A dangling symlink of our own name is almost always this installer's work
+  # from somewhere else -- run once from a git clone that has since been
+  # deleted, or from a previous plugin folder. Treated as a foreign file it
+  # produced the worst possible outcome: "refusing to replace it" about a dead
+  # link that nothing else would ever repair, and a broken command left on PATH.
+  # Say what it is and offer the one-line fix rather than stopping flat.
+  if [[ -L $LINK && ! -e $LINK ]]; then
+    cat >&2 <<MSG
+$LINK is a broken symlink, pointing at:
+
+    $(readlink "$LINK")
+
+That target no longer exists -- most likely this installer was run from a copy
+of the plugin that has since been deleted. Nothing else will repair it, so it is
+yours to clear before linking again:
+
+    rm -f "$LINK" && "$HERE/install.sh"
+
+MSG
+    exit 1
+  fi
+
   cat >&2 <<MSG
 $LINK already exists and is not this plugin's symlink.
 

@@ -1,22 +1,77 @@
+SHELL := /bin/bash
+
 PLUGIN_DIR ?= $(HOME)/.config/omarchy/plugins/vitorcanoas.nightlight
 QMLLINT ?= /usr/lib/qt6/bin/qmllint
 OMARCHY_PATH ?= /usr/share/omarchy
+QML_IMPORT_PATHS ?= /usr/lib/qt6/qml /usr/lib/x86_64-linux-gnu/qt6/qml
 
-.PHONY: validate lint dev
+.PHONY: validate lint test test-model test-cli shellcheck dev
 
 validate:
 	omarchy plugin validate .
 	git diff --check
 	bash -n bin/omarchy-nightlight
 	bash -n install.sh
+	node --check Model.js
 
 # qmllint needs an import root that CONTAINS a directory named `qs`, because the
 # modules are `qs.Ui` and `qs.Commons`. Pointing -I straight at the shell fails
 # to resolve them, which looks like a broken plugin and is not.
 lint:
-	@rm -rf .lint && mkdir -p .lint && ln -s "$(OMARCHY_PATH)/shell" .lint/qs
-	-$(QMLLINT) -I .lint -I /usr/lib/qt6/qml Panel.qml
-	@rm -rf .lint
+	@set -eu; \
+	trap 'rm -rf .lint' EXIT; \
+	rm -rf .lint; \
+	command -v "$(QMLLINT)" >/dev/null 2>&1 || { \
+		printf 'qmllint not found: %s\n' "$(QMLLINT)" >&2; \
+		exit 1; \
+	}; \
+	mkdir -p .lint; \
+	ln -s "$(OMARCHY_PATH)/shell" .lint/qs; \
+	qml_import_args=(-I .lint); \
+	for path in $(QML_IMPORT_PATHS); do \
+		if [ -d "$$path" ]; then qml_import_args+=(-I "$$path"); fi; \
+	done; \
+	qmlint_help=$$("$(QMLLINT)" --help 2>&1) || { \
+		printf 'failed to query qmllint options\n' >&2; exit 1; \
+	}; \
+	has_qmllint_option() { grep -Fq -- "$$1" <<<"$$qmlint_help"; }; \
+	if has_qmllint_option '--max-warnings' && \
+		has_qmllint_option '--missing-property' && \
+		has_qmllint_option '--missing-type' && \
+		has_qmllint_option '--signal-handler-parameters' && \
+		has_qmllint_option '--unresolved-type'; then \
+		qml_import_args+=(--max-warnings 0 \
+			--import info \
+			--required info \
+			--missing-property info \
+			--missing-type info \
+			--signal-handler-parameters info \
+			--unqualified info \
+			--unresolved-type info); \
+	elif has_qmllint_option '--property' && \
+		has_qmllint_option '--required' && \
+		has_qmllint_option '--signal' && \
+		has_qmllint_option '--type' && \
+		has_qmllint_option '--unqualified'; then \
+		# Qt 6.4 has the older category names and fails on every warning. \
+		# Keep host-provided Quickshell diagnostics informational while still \
+		# failing on parser/compiler errors. \
+		qml_import_args+=(--import info --property info --required info --signal info --type info --unqualified info); \
+	else \
+		printf 'unsupported qmllint command-line interface\n' >&2; exit 1; \
+	fi; \
+	"$(QMLLINT)" "$${qml_import_args[@]}" Panel.qml
+
+test: test-model test-cli
+
+test-model:
+	node tests/model.test.js
+
+test-cli:
+	bash tests/cli.test.sh
+
+shellcheck:
+	shellcheck bin/omarchy-nightlight install.sh tests/cli.test.sh
 
 # Sync this working tree into the local plugin directory so the running shell
 # picks up in-progress changes. The shell reloads plugin code on save; the
@@ -24,14 +79,33 @@ lint:
 # symlink because omarchy-plugin-validate refuses symlinks inside a plugin.
 dev:
 	@test -f manifest.json || { printf 'run make dev from the plugin repo root\n' >&2; exit 1; }
-	# rsync --delete on the wrong PLUGIN_DIR would empty it. $$HOME or a bare
-	# path is never a plugin directory, and the cost of being wrong here is
-	# someone's home directory.
-	@case "$(PLUGIN_DIR)" in \
-	  */omarchy/plugins/*) ;; \
-	  *) printf 'refusing to sync to %s: PLUGIN_DIR must be under omarchy/plugins/\n' "$(PLUGIN_DIR)" >&2; exit 1 ;; \
-	esac
-	@mkdir -p "$(PLUGIN_DIR)"
-	rsync -a --delete --exclude '.git/' --exclude '.lint/' ./ "$(PLUGIN_DIR)/"
-	omarchy-shell -q shell rescanPlugins
-	@printf 'synced to %s\n' "$(PLUGIN_DIR)"
+	# rsync --delete on the wrong PLUGIN_DIR would empty it, and the cost of
+	# being wrong is someone else's installed plugins. Matching "contains
+	# /omarchy/plugins/" was not enough: a trailing slash or a "/." component --
+	# exactly what a person types for a directory -- left PLUGIN_DIR pointing at
+	# the plugins directory ITSELF, where --delete wipes every sibling plugin.
+	# So normalise those away first, then demand the path be one level below
+	# plugins/ and nothing else.
+	@dir='$(PLUGIN_DIR)'; \
+	while :; do \
+	  case "$$dir" in \
+	    */.) dir=$${dir%/.} ;; \
+	    */) dir=$${dir%/} ;; \
+	    *) break ;; \
+	  esac; \
+	done; \
+	case "$${dir%/*}" in \
+	  */omarchy/plugins) ;; \
+	  *) printf 'refusing to sync to %s: PLUGIN_DIR must name a directory directly under omarchy/plugins/\n' "$$dir" >&2; exit 1 ;; \
+	esac; \
+	case "$${dir##*/}" in \
+	  ''|.|..) printf 'refusing to sync to %s: that is the plugins directory itself, not a plugin\n' "$$dir" >&2; exit 1 ;; \
+	esac; \
+	if [ -L "$$dir" ]; then \
+		printf 'refusing to sync to %s: PLUGIN_DIR must not be a symlink\n' "$$dir" >&2; exit 1; \
+	fi; \
+	mkdir -p "$$dir"; \
+	[ ! -L "$$dir" ] || { printf 'refusing to sync to %s: target became a symlink\n' "$$dir" >&2; exit 1; }; \
+	rsync -a --delete --exclude '.git/' --exclude '.lint/' ./ "$$dir/" || exit 1; \
+	omarchy-shell -q shell rescanPlugins; \
+	printf 'synced to %s\n' "$$dir"
