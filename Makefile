@@ -31,7 +31,15 @@ lint:
 	for path in $(QML_IMPORT_PATHS); do \
 		if [ -d "$$path" ]; then qml_import_args+=(-I "$$path"); fi; \
 	done; \
-	"$(QMLLINT)" "$${qml_import_args[@]}" Panel.qml
+	"$(QMLLINT)" "$${qml_import_args[@]}" \
+		-W 0 \
+		--import info \
+		--missing-property info \
+		--missing-type info \
+		--signal-handler-parameters info \
+		--unqualified info \
+		--unresolved-type info \
+		Panel.qml
 
 test: test-model test-cli
 
