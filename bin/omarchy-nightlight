@@ -670,6 +670,22 @@ conflict_warning() {
   printf 'hyprsunset is running and fighting wl-gammarelay-rs for the same outputs. Stop it: pkill hyprsunset'
 }
 
+# Live Hyprland monitors the daemon could not bind. Night light is a gamma ramp,
+# and a screen whose driver exposes no GAMMA_LUT (EVDI / DisplayLink / Silicon
+# Motion docks, "DVI-I-N") gets gamma_control::Failed from the compositor, so it
+# never shows up under /outputs. Without this the panel just lists fewer screens
+# than the desktop has, which reads as a detection bug. Prints one line or nothing.
+unsupported_warning() {
+  command -v hyprctl >/dev/null 2>&1 || return 0
+  local m known=" $(outputs_uncached | tr '\n' ' ') " missing=""
+  [[ $known == "  " ]] && return 0   # daemon bound nothing: a different problem
+  while read -r m; do
+    [[ -n $m && $known != *" $m "* ]] && missing+="${missing:+, }$m"
+  done < <(hyprctl monitors 2>/dev/null | sed -n 's/^Monitor \([^ ]*\) (ID.*/\1/p')
+  [[ -n $missing ]] || return 0
+  printf '%s: no gamma control from this display driver (typical for USB docks), so night light cannot apply there.' "$missing"
+}
+
 # Omarchy's shared on-screen display, so a keybinding gets visual feedback.
 # There is no night-light icon in the Omarchy OSD; "brightness" is the closest.
 osd() {
@@ -806,7 +822,7 @@ version_command() {
 # ---------------------------------------------------------------------------
 show() {
   local o k b warning
-  warning=$(conflict_warning)
+  warning=$(conflict_warning); [[ -n $warning ]] || warning=$(unsupported_warning)
   [[ -n $warning ]] && printf 'warning: %s\n\n' "$warning" >&2
   for o in $(outputs); do
     k=$(kelvin_of "$o")
@@ -822,7 +838,8 @@ show() {
 # The contract the bar widget reads. Keep the key names stable.
 json() {
   local o k b pct on configured first=1
-  printf '{"warning":"%s","daemon":true,"outputs":[' "$(conflict_warning)"
+  local warn; warn=$(conflict_warning); [[ -n $warn ]] || warn=$(unsupported_warning)
+  printf '{"warning":"%s","daemon":true,"outputs":[' "$warn"
   for o in $(outputs); do
     # One read of the temperature, reused for both the value and the on/off
     # decision. Calling is_on here meant a second busctl round trip per screen.
